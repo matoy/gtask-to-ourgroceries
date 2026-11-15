@@ -36,6 +36,7 @@ for mod_name in [
 
 from api.sync import (
     clean_task_title,
+    find_exact_local_match,
     parse_and_match_item,
     split_crossed_off_for_cleanup,
 )
@@ -121,6 +122,23 @@ class TestFuzzyMatching(unittest.TestCase):
         all_ids = {i["id"] for i in kept + to_delete}
         self.assertNotIn("a1", all_ids)
         self.assertNotIn("a2", all_ids)
+
+    def test_find_exact_local_match(self):
+        # Correspondance exacte (singulier/pluriel) -> court-circuite Gemini
+        tomate = find_exact_local_match("une tomate", self.og_items)
+        self.assertIsNotNone(tomate)
+        self.assertEqual(tomate["value"], "Tomates")
+
+        # Correspondance exacte (ligature/casse) -> court-circuite Gemini
+        oeufs = find_exact_local_match("des oeufs", self.og_items)
+        self.assertIsNotNone(oeufs)
+        self.assertEqual(oeufs["value"], "Œufs")
+
+        # Générique / marque ("du lait" vs "lait cawol") -> laissé à Gemini
+        self.assertIsNone(find_exact_local_match("du lait", self.og_items))
+
+        # Équivalence culinaire ("galettes blé noir") -> laissé à Gemini
+        self.assertIsNone(find_exact_local_match("galettes blé noir", self.og_items))
 
 
 if __name__ == "__main__":

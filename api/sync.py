@@ -1,5 +1,6 @@
 import asyncio
 from difflib import SequenceMatcher
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler
 import hmac
 import json
@@ -60,6 +61,7 @@ def clean_task_title(raw_task_name: str) -> str:
     return name
 
 
+@lru_cache(maxsize=512)
 def normalize_for_comparison(text: str) -> str:
     """Normalise une chaîne pour la comparaison (minuscules, sans accents ni ligatures)."""
     text = text.lower().strip()
@@ -72,6 +74,7 @@ def normalize_for_comparison(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+@lru_cache(maxsize=512)
 def singularize_french(normalized_text: str) -> str:
     """Rapprochement singulier/pluriel basique mot par mot pour le français."""
     words = []
@@ -224,6 +227,44 @@ def parse_and_match_item(
     return None, round(best_score, 3), formatted_name
 
 
+def _pick_best_matching_item(matches: list[dict]) -> dict | None:
+    """Privilégie un article barré (le plus récemment rayé), sinon le premier article trouvé."""
+    if not matches:
+        return None
+    crossed = [item for item in matches if is_item_crossed_off(item)]
+    if crossed:
+        return max(crossed, key=crossed_off_timestamp)
+    return matches[0]
+
+
+def find_exact_local_match(raw_task_name: str, og_items: list[dict]) -> dict | None:
+    """
+    Cherche une correspondance directe (score == 1.0 : insensible à la casse,
+    aux accents/ligatures et au singulier/pluriel) dans la liste OurGroceries,
+    afin d'éviter un appel Gemini inutile.
+    """
+    cleaned_name = clean_task_title(raw_task_name)
+    if not cleaned_name:
+        return None
+
+    norm_input = normalize_for_comparison(cleaned_name)
+    if not norm_input:
+        return None
+    sing_input = singularize_french(norm_input)
+
+    exact_matches: list[dict] = []
+    for item in og_items:
+        item_value = item.get("value", "").strip()
+        if not item_value:
+            continue
+        norm_cat = normalize_for_comparison(item_value)
+        sing_cat = singularize_french(norm_cat)
+        if norm_input == norm_cat or (sing_input and sing_input == sing_cat):
+            exact_matches.append(item)
+
+    return _pick_best_matching_item(exact_matches)
+
+
 def find_catalog_item(matched_name: str | None, og_items: list[dict]) -> dict | None:
     """Retrouve un dictionnaire d'article dans og_items depuis le nom renvoyé par Gemini."""
     if not matched_name:
@@ -232,18 +273,10 @@ def find_catalog_item(matched_name: str | None, og_items: list[dict]) -> dict | 
     if not candidate or candidate.lower() in ("null", "none"):
         return None
 
-    def pick_best(matches: list[dict]) -> dict | None:
-        if not matches:
-            return None
-        crossed = [item for item in matches if is_item_crossed_off(item)]
-        if crossed:
-            return max(crossed, key=crossed_off_timestamp)
-        return matches[0]
-
     # 1. Correspondance exacte
     exact = [item for item in og_items if item.get("value", "") == candidate]
     if exact:
-        return pick_best(exact)
+        return _pick_best_matching_item(exact)
 
     # 2. Correspondance insensible à la casse
     lower_cand = candidate.lower()
@@ -251,7 +284,7 @@ def find_catalog_item(matched_name: str | None, og_items: list[dict]) -> dict | 
         item for item in og_items if item.get("value", "").strip().lower() == lower_cand
     ]
     if case_insensitive:
-        return pick_best(case_insensitive)
+        return _pick_best_matching_item(case_insensitive)
 
     # 3. Correspondance normalisée (sans accents / ligatures)
     norm_cand = normalize_for_comparison(candidate)
@@ -262,7 +295,7 @@ def find_catalog_item(matched_name: str | None, og_items: list[dict]) -> dict | 
             if normalize_for_comparison(item.get("value", "")) == norm_cand
         ]
         if normalized:
-            return pick_best(normalized)
+            return _pick_best_matching_item(normalized)
 
     return None
 
@@ -450,10 +483,18 @@ def get_google_tasks_service():
     return build("tasks", "v1", credentials=creds, cache_discovery=False)
 
 
+# Cache en mémoire du client Google Keep pour les exécutions successives ("Warm Container")
+_KEEP_CACHE: dict[str, object] = {
+    "email": None,
+    "master_token": None,
+    "client": None,
+}
+
+
 def get_google_keep_pending_items() -> tuple[object, list[dict]]:
     """
-    Authentifie le client Google Keep via Master Token et retourne :
-      (keep_client, liste_des_articles_non_cochés)
+    Authentifie (ou rafraîchit via sync incrémentale) le client Google Keep
+    via Master Token et retourne : (keep_client, liste_des_articles_non_cochés).
     """
     if gkeepapi is None:
         raise RuntimeError(
@@ -470,13 +511,31 @@ def get_google_keep_pending_items() -> tuple[object, list[dict]]:
             "GOOGLE_KEEP_MASTER_TOKEN et GOOGLE_KEEP_NOTE_ID sont requis."
         )
 
-    keep = gkeepapi.Keep()
-    try:
-        keep.authenticate(keep_email, keep_master_token)
-    except Exception as auth_err:
-        raise RuntimeError(
-            f"Échec d'authentification Google Keep pour '{keep_email}' : {auth_err}"
-        ) from auth_err
+    keep = None
+    if (
+        _KEEP_CACHE["client"] is not None
+        and _KEEP_CACHE["email"] == keep_email
+        and _KEEP_CACHE["master_token"] == keep_master_token
+    ):
+        cached_keep = _KEEP_CACHE["client"]
+        try:
+            cached_keep.sync()
+            keep = cached_keep
+        except Exception:
+            keep = None
+
+    if keep is None:
+        keep = gkeepapi.Keep()
+        try:
+            keep.authenticate(keep_email, keep_master_token)
+        except Exception as auth_err:
+            _KEEP_CACHE["client"] = None
+            raise RuntimeError(
+                f"Échec d'authentification Google Keep pour '{keep_email}' : {auth_err}"
+            ) from auth_err
+        _KEEP_CACHE["email"] = keep_email
+        _KEEP_CACHE["master_token"] = keep_master_token
+        _KEEP_CACHE["client"] = keep
 
     keep_note = keep.get(keep_note_id)
     if keep_note is None or getattr(keep_note, "trashed", False):
@@ -515,6 +574,19 @@ def get_google_keep_pending_items() -> tuple[object, list[dict]]:
         if (getattr(item, "text", "") or "").strip()
     ]
     return keep, pending_items
+
+
+async def _gather_bounded(coro_factories: list, limit: int = 5) -> None:
+    """Exécute des appels réseau asynchrones en parallèle avec une concurrence bornée."""
+    if not coro_factories:
+        return
+    sem = asyncio.Semaphore(limit)
+
+    async def _run_one(factory):
+        async with sem:
+            return await factory()
+
+    await asyncio.gather(*(_run_one(factory) for factory in coro_factories))
 
 
 def _build_sync_response(
@@ -668,10 +740,13 @@ async def sync_tasks_to_groceries(
         )
         if items_to_delete:
             deleted_mem_ids = {id(item) for item in items_to_delete}
+            delete_tasks = []
             for item in items_to_delete:
                 item_id = item.get("id")
                 if not dry_run and item_id:
-                    await og.remove_item_from_list(og_list_id, item_id)
+                    delete_tasks.append(
+                        lambda lid=og_list_id, iid=item_id: og.remove_item_from_list(lid, iid)
+                    )
                 deleted_crossed_off_items.append(
                     {
                         "id": item_id,
@@ -679,6 +754,8 @@ async def sync_tasks_to_groceries(
                         "crossedOffAt": item.get("crossedOffAt"),
                     }
                 )
+            if delete_tasks:
+                await _gather_bounded(delete_tasks, limit=5)
             og_items = [item for item in og_items if id(item) not in deleted_mem_ids]
 
     if not pending_tasks:
@@ -691,30 +768,50 @@ async def sync_tasks_to_groceries(
             deleted_crossed_off_items,
         )
 
-    # 3. Réconciliation intelligente via Gemini Flash (avec fallback algorithmique)
+    # 3. Pré-filtrage exact local (évite Gemini sur score == 1.0), puis appel Gemini ciblé
+    exact_local_matches: dict[int, dict] = {}
+    unresolved_indices: list[int] = []
+    for idx, task in enumerate(pending_tasks):
+        exact_item = find_exact_local_match(task["title"], og_items)
+        if exact_item is not None:
+            exact_local_matches[idx] = exact_item
+        else:
+            unresolved_indices.append(idx)
+
     gemini_matches: dict[int, dict] = {}
     gemini_error: str | None = None
-    if gemini_api_key:
+    if gemini_api_key and unresolved_indices:
         try:
+            unresolved_titles = [pending_tasks[i]["title"] for i in unresolved_indices]
             raw_results = match_tasks_with_gemini(
-                [t["title"] for t in pending_tasks],
+                unresolved_titles,
                 og_items,
                 api_key=gemini_api_key,
                 model=gemini_model,
             )
             for entry in raw_results:
                 if isinstance(entry, dict) and isinstance(entry.get("task_index"), int):
-                    gemini_matches[entry["task_index"]] = entry
+                    sub_idx = entry["task_index"]
+                    if 0 <= sub_idx < len(unresolved_indices):
+                        gemini_matches[unresolved_indices[sub_idx]] = entry
         except Exception as exc:
             gemini_error = str(exc)
 
-    # 4. Traitement de chaque tâche
+    # 4. Traitement de chaque tâche et préparation des écritures OurGroceries
     processed_items = []
-    keep_dirty = False
+    og_write_tasks = []
+    tasks_to_mark_done = []
+
     for idx, task in enumerate(pending_tasks):
         raw_title = task["title"]
 
-        if idx in gemini_matches:
+        if idx in exact_local_matches:
+            matched_item = exact_local_matches[idx]
+            target_name = matched_item["value"]
+            score = 1.0
+            matching_engine = "exact_local"
+            reason = "Correspondance directe dans la liste OurGroceries (sans appel Gemini)."
+        elif idx in gemini_matches:
             entry = gemini_matches[idx]
             matched_catalog_name = entry.get("matched_catalog_item")
             confidence = round(float(entry.get("confidence") or 0.0), 3)
@@ -770,10 +867,13 @@ async def sync_tasks_to_groceries(
             if is_crossed_off:
                 action = "uncrossed_existing"
                 if not dry_run and matched_item.get("id"):
-                    await og.toggle_item_crossed_off(
-                        list_id=og_list_id,
-                        item_id=matched_item["id"],
-                        cross_off=False,
+                    item_id = matched_item["id"]
+                    og_write_tasks.append(
+                        lambda lid=og_list_id, iid=item_id: og.toggle_item_crossed_off(
+                            list_id=lid,
+                            item_id=iid,
+                            cross_off=False,
+                        )
                     )
                 matched_item["crossedOff"] = False
                 matched_item["crossedOffAt"] = None
@@ -782,28 +882,20 @@ async def sync_tasks_to_groceries(
         else:
             action = "created_new"
             if not dry_run:
-                await og.add_item_to_list(
-                    list_id=og_list_id,
-                    value=target_name,
-                    auto_category=True,
+                item_val = target_name
+                og_write_tasks.append(
+                    lambda lid=og_list_id, val=item_val: og.add_item_to_list(
+                        list_id=lid,
+                        value=val,
+                        auto_category=True,
+                    )
                 )
             # Ajout en mémoire pour éviter un doublon si le même article apparaît 2 fois dans le lot
             og_items.append(
                 {"id": None, "value": target_name, "crossedOff": False, "crossedOffAt": None}
             )
 
-        # 5. Cocher l'article dans Google Keep (ou marquer terminé dans Google Tasks)
-        if not dry_run:
-            if source_name == "google_keep":
-                task["_keep_item"].checked = True
-                keep_dirty = True
-            else:
-                tasks_service.tasks().patch(
-                    tasklist=task_list_id,
-                    task=task["id"],
-                    body={"status": "completed"},
-                ).execute()
-
+        tasks_to_mark_done.append(task)
         processed_items.append(
             {
                 "google_task_id": task["id"],
@@ -816,8 +908,23 @@ async def sync_tasks_to_groceries(
             }
         )
 
-    if not dry_run and source_name == "google_keep" and keep_dirty and keep_client is not None:
-        keep_client.sync()
+    # 5. Exécution parallèle des écritures OurGroceries, puis clôture dans Google Keep / Tasks
+    if not dry_run:
+        await _gather_bounded(og_write_tasks, limit=5)
+
+        if tasks_to_mark_done:
+            if source_name == "google_keep":
+                for task in tasks_to_mark_done:
+                    task["_keep_item"].checked = True
+                if keep_client is not None:
+                    keep_client.sync()
+            else:
+                for task in tasks_to_mark_done:
+                    tasks_service.tasks().patch(
+                        tasklist=task_list_id,
+                        task=task["id"],
+                        body={"status": "completed"},
+                    ).execute()
 
     return _build_sync_response(
         source_name,
