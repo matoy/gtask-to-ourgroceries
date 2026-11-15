@@ -34,7 +34,11 @@ for mod_name in [
         setattr(dummy, "OurGroceries", object)
         sys.modules[mod_name] = dummy
 
-from api.sync import clean_task_title, parse_and_match_item
+from api.sync import (
+    clean_task_title,
+    parse_and_match_item,
+    split_crossed_off_for_cleanup,
+)
 
 
 class TestFuzzyMatching(unittest.TestCase):
@@ -99,6 +103,24 @@ class TestFuzzyMatching(unittest.TestCase):
         self.assertIsNone(item)
         self.assertLess(score, 0.75)
         self.assertEqual(name, "Chocolat noir")
+
+    def test_split_crossed_off_for_cleanup(self):
+        items = [
+            {"id": "a1", "value": "Actif 1", "crossedOff": False},
+            {"id": "a2", "value": "Actif 2"},
+            {"id": "c_no_ts", "value": "Ancien sans date", "crossedOff": True},
+            {"id": "c_old", "value": "Vieux", "crossedOffAt": 1700000001000},
+            {"id": "c_mid", "value": "Moyen", "crossedOffAt": 1700000002000},
+            {"id": "c_new", "value": "Récent", "crossedOffAt": 1700000003000},
+        ]
+        kept, to_delete = split_crossed_off_for_cleanup(items, keep_count=2)
+
+        self.assertEqual([i["id"] for i in kept], ["c_new", "c_mid"])
+        self.assertEqual([i["id"] for i in to_delete], ["c_old", "c_no_ts"])
+
+        all_ids = {i["id"] for i in kept + to_delete}
+        self.assertNotIn("a1", all_ids)
+        self.assertNotIn("a2", all_ids)
 
 
 if __name__ == "__main__":

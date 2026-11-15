@@ -101,6 +101,35 @@ def is_item_crossed_off(item: dict) -> bool:
     return bool(item.get("crossedOffAt") or item.get("crossedOff"))
 
 
+def crossed_off_timestamp(item: dict) -> float:
+    """Retourne l'horodatage numérique de rayure (crossedOffAt), ou 0.0 si absent."""
+    raw = item.get("crossedOffAt")
+    if raw is None or isinstance(raw, bool):
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def split_crossed_off_for_cleanup(
+    og_items: list[dict],
+    keep_count: int = 80,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Sépare les articles rayés entre ceux à conserver (les `keep_count` plus récents
+    selon `crossedOffAt`) et les plus anciens à supprimer.
+    """
+    keep_n = max(0, int(keep_count))
+    crossed_items = [item for item in og_items if is_item_crossed_off(item)]
+    crossed_sorted = sorted(
+        crossed_items,
+        key=crossed_off_timestamp,
+        reverse=True,
+    )
+    return crossed_sorted[:keep_n], crossed_sorted[keep_n:]
+
+
 FRENCH_STOPWORDS = {
     "les",
     "des",
@@ -174,15 +203,20 @@ def parse_and_match_item(
                 token_score = 0.88 if cat_words[0] == sig_input[0] else 0.80
                 score = max(score, token_score)
 
-        # En cas d'égalité parfaite de score, on privilégie l'article barré (à réactiver)
-        if score > best_score or (
-            score == best_score
-            and best_item is not None
-            and is_item_crossed_off(item)
-            and not is_item_crossed_off(best_item)
-        ):
+        # En cas d'égalité parfaite de score, on privilégie l'article barré (à réactiver),
+        # puis le plus récemment rayé.
+        if score > best_score:
             best_score = score
             best_item = item
+        elif score == best_score and best_item is not None:
+            item_crossed = is_item_crossed_off(item)
+            best_crossed = is_item_crossed_off(best_item)
+            if (item_crossed and not best_crossed) or (
+                item_crossed
+                and best_crossed
+                and crossed_off_timestamp(item) > crossed_off_timestamp(best_item)
+            ):
+                best_item = item
 
     if best_item is not None and best_score >= cutoff:
         return best_item, round(best_score, 3), best_item["value"]
@@ -201,9 +235,9 @@ def find_catalog_item(matched_name: str | None, og_items: list[dict]) -> dict | 
     def pick_best(matches: list[dict]) -> dict | None:
         if not matches:
             return None
-        for item in matches:
-            if is_item_crossed_off(item):
-                return item
+        crossed = [item for item in matches if is_item_crossed_off(item)]
+        if crossed:
+            return max(crossed, key=crossed_off_timestamp)
         return matches[0]
 
     # 1. Correspondance exacte
@@ -261,7 +295,7 @@ def match_tasks_with_gemini(
 
     prompt = (
         "Tu es un assistant chargé de réconcilier des articles de liste de courses en français "
-        "dictés à la voix sur Google Home (Google Tasks) avec les articles déjà existants dans "
+        "dictés à la voix sur Google Home (Google Keep / Google Tasks) avec les articles déjà existants dans "
         "la liste OurGroceries de l'utilisateur.\n\n"
         "Règles :\n"
         "1. Pour chaque tâche dans `tasks`, nettoie mentalement les commandes vocales et articles "
@@ -271,8 +305,12 @@ def match_tasks_with_gemini(
         "(ex: 'Lait' -> 'lait cawol', 'Beurre' -> 'Beurre demi-sel').\n"
         "   - Reconnais les synonymes et métonymies courantes "
         "(ex: 'Sopalin' -> 'Essuie-tout', 'PQ' -> 'Papier toilette', 'Coca' -> 'Cola').\n"
+        "   - Reconnais les équivalences culinaires, régionales et d'ingrédients désignant le même produit en rayon "
+        "(ex: 'galettes blé noir' ou 'galettes de sarrasin' -> 'galettes bretonnes', "
+        "'crème liquide' -> 'crème fleurette', 'fromage râpé' -> 'emmental râpé').\n"
         "   - Tolère le singulier/pluriel, les accents, les ligatures (oeufs/œufs) et les fautes de dictée vocale.\n"
-        "   - Ne force pas une correspondance absurde : en cas de doute ou si le produit est vraiment différent, crée un nouvel article.\n"
+        "   - Privilégie la réutilisation d'un article existant du `catalog` dès qu'il s'agit du même produit acheté habituellement par le foyer. "
+        "Ne crée un nouvel article (`null`) que si le produit est réellement distinct (ex: 'galettes de riz' vs 'galettes bretonnes').\n"
         "3. Si un article du catalogue correspond, renseigne `matched_catalog_item` avec sa chaîne EXACTE "
         "telle qu'elle apparaît dans `catalog` (sinon mets `null`).\n"
         "4. Renseigne `clean_new_name` avec le nom propre nettoyé et une majuscule initiale (ex: 'Chocolat noir').\n"
@@ -479,13 +517,51 @@ def get_google_keep_pending_items() -> tuple[object, list[dict]]:
     return keep, pending_items
 
 
-async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
+def _build_sync_response(
+    source_name: str,
+    dry_run: bool,
+    has_pending_tasks: bool,
+    processed_items: list[dict],
+    keep_crossed_off: int | None,
+    deleted_crossed_off_items: list[dict],
+) -> dict:
+    """Construit la réponse JSON standardisée de /api/sync."""
+    if has_pending_tasks:
+        message = f"{len(processed_items)} article(s) traité(s) avec succès."
+    else:
+        message = "Aucun nouvel article à synchroniser."
+
+    if deleted_crossed_off_items:
+        message = (
+            f"{message} {len(deleted_crossed_off_items)} ancien(s) article(s) "
+            "rayé(s) supprimé(s)."
+        )
+
+    response: dict = {
+        "status": "ok",
+        "source": source_name,
+        "dry_run": dry_run,
+        "synced_count": len(processed_items),
+        "message": message,
+        "items": processed_items,
+    }
+    if keep_crossed_off is not None:
+        response["deleted_crossed_off_count"] = len(deleted_crossed_off_items)
+        response["deleted_crossed_off_items"] = deleted_crossed_off_items
+    return response
+
+
+async def sync_tasks_to_groceries(
+    dry_run: bool = False,
+    keep_crossed_off: int | None = None,
+) -> dict:
     """
     Exécute la synchronisation complète :
     1. Lit les articles non cochés dans Google Keep (ou Google Tasks si configuré en repli).
-    2. Réconcilie chaque article avec OurGroceries (Gemini Flash + fallback algorithmique).
-    3. Décoche l'article existant ou crée le nouvel article dans OurGroceries.
-    4. Coche l'article dans Google Keep (ou marque la tâche terminée dans Google Tasks).
+    2. Nettoie éventuellement les anciens articles rayés OurGroceries au-delà des `keep_crossed_off` plus récents.
+    3. Réconcilie chaque article avec OurGroceries (Gemini Flash + fallback algorithmique).
+    4. Décoche l'article existant ou crée le nouvel article dans OurGroceries.
+    5. Coche l'article dans Google Keep (ou marque la tâche terminée dans Google Tasks).
     """
     og_user = get_env_clean("OG_USERNAME")
     og_pass = get_env_clean("OG_PASSWORD")
@@ -494,6 +570,18 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
         raise ValueError(
             "Variables OurGroceries manquantes : OG_USERNAME, OG_PASSWORD et OG_LIST_ID sont requis."
         )
+
+    if keep_crossed_off is None:
+        env_keep_crossed = get_env_clean("OG_KEEP_CROSSED_OFF")
+        if env_keep_crossed:
+            try:
+                keep_crossed_off = int(env_keep_crossed)
+            except ValueError as err:
+                raise ValueError(
+                    f"Variable OG_KEEP_CROSSED_OFF invalide ('{env_keep_crossed}') : un entier >= 0 est attendu."
+                ) from err
+    if keep_crossed_off is not None and keep_crossed_off < 0:
+        raise ValueError("keep_crossed_off doit être un entier supérieur ou égal à 0.")
 
     cutoff = float(get_env_clean("MATCH_CUTOFF", "0.75") or "0.75")
     gemini_api_key = get_env_clean("GEMINI_API_KEY")
@@ -525,15 +613,8 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
         raw_tasks = results.get("items", [])
         pending_tasks = [t for t in raw_tasks if t.get("title", "").strip()]
 
-    if not pending_tasks:
-        return {
-            "status": "ok",
-            "source": source_name,
-            "dry_run": dry_run,
-            "synced_count": 0,
-            "message": "Aucun nouvel article à synchroniser.",
-            "items": [],
-        }
+    if not pending_tasks and keep_crossed_off is None:
+        return _build_sync_response(source_name, dry_run, False, [], None, [])
 
     # 2. Connexion à OurGroceries et lecture des éléments de la liste cible
     og = OurGroceries(og_user, og_pass)
@@ -578,6 +659,37 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
             ) from list_err
 
     og_items = list_details.get("list", {}).get("items", [])
+
+    # 2b. Nettoyage optionnel des anciens articles rayés au-delà des `keep_crossed_off` plus récents
+    deleted_crossed_off_items: list[dict] = []
+    if keep_crossed_off is not None:
+        _, items_to_delete = split_crossed_off_for_cleanup(
+            og_items, keep_count=keep_crossed_off
+        )
+        if items_to_delete:
+            deleted_mem_ids = {id(item) for item in items_to_delete}
+            for item in items_to_delete:
+                item_id = item.get("id")
+                if not dry_run and item_id:
+                    await og.remove_item_from_list(og_list_id, item_id)
+                deleted_crossed_off_items.append(
+                    {
+                        "id": item_id,
+                        "value": item.get("value", ""),
+                        "crossedOffAt": item.get("crossedOffAt"),
+                    }
+                )
+            og_items = [item for item in og_items if id(item) not in deleted_mem_ids]
+
+    if not pending_tasks:
+        return _build_sync_response(
+            source_name,
+            dry_run,
+            False,
+            [],
+            keep_crossed_off,
+            deleted_crossed_off_items,
+        )
 
     # 3. Réconciliation intelligente via Gemini Flash (avec fallback algorithmique)
     gemini_matches: dict[int, dict] = {}
@@ -707,14 +819,14 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
     if not dry_run and source_name == "google_keep" and keep_dirty and keep_client is not None:
         keep_client.sync()
 
-    return {
-        "status": "ok",
-        "source": source_name,
-        "dry_run": dry_run,
-        "synced_count": len(processed_items),
-        "message": f"{len(processed_items)} article(s) traité(s) avec succès.",
-        "items": processed_items,
-    }
+    return _build_sync_response(
+        source_name,
+        dry_run,
+        True,
+        processed_items,
+        keep_crossed_off,
+        deleted_crossed_off_items,
+    )
 
 
 def is_authorized(headers, query_params: dict) -> bool:
@@ -761,9 +873,29 @@ class handler(BaseHTTPRequestHandler):
             return
 
         dry_run = query_params.get("dry_run", ["0"])[0].lower() in ("1", "true", "yes")
+        keep_crossed_off: int | None = None
+        if "keep_crossed_off" in query_params:
+            raw_keep = query_params["keep_crossed_off"][0].strip()
+            if raw_keep:
+                try:
+                    keep_crossed_off = int(raw_keep)
+                except ValueError:
+                    self._send_json(
+                        400,
+                        {
+                            "status": "config_error",
+                            "message": f"Paramètre keep_crossed_off invalide : '{raw_keep}'.",
+                        },
+                    )
+                    return
 
         try:
-            payload = asyncio.run(sync_tasks_to_groceries(dry_run=dry_run))
+            payload = asyncio.run(
+                sync_tasks_to_groceries(
+                    dry_run=dry_run,
+                    keep_crossed_off=keep_crossed_off,
+                )
+            )
             self._send_json(200, payload)
         except ValueError as cfg_err:
             self._send_json(
