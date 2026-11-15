@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Assistant d'initialisation interactif pour gtask-to-ourgroceries.
+Assistant d'initialisation interactif pour gtask-to-ourgroceries (Google Keep -> OurGroceries).
 
 Ce script permet de :
-1. Obtenir (ou réutiliser depuis .env) votre GOOGLE_REFRESH_TOKEN via OAuth2.
-2. Lister vos listes Google Tasks et récupérer votre GOOGLE_TASK_LIST_ID.
+1. Obtenir (ou réutiliser depuis .env) votre GOOGLE_KEEP_MASTER_TOKEN.
+2. Lister vos listes Google Keep et récupérer votre GOOGLE_KEEP_NOTE_ID.
 3. Tester la connexion OurGroceries et récupérer votre OG_LIST_ID.
-4. Générer (ou conserver) un CRON_SECRET et sauvegarder toutes les clés dans .env,
+4. Configurer optionnellement votre clé gratuite GEMINI_API_KEY (Google AI Studio).
+5. Générer (ou conserver) un CRON_SECRET et sauvegarder toutes les clés dans .env,
    prêt à être copié-collé dans les Environment Variables de Vercel.
 
 Prérequis :
-    pip install -r requirements.txt google-auth-oauthlib
+    pip install -r requirements.txt gpsoauth
 """
 
 import asyncio
 import getpass
-import glob
 import json
 import os
 import secrets
 import sys
+import urllib.error
+from urllib.parse import quote
+import urllib.request
+import webbrowser
 
 
 def load_existing_env(env_path: str = ".env") -> dict[str, str]:
@@ -47,8 +51,8 @@ def load_existing_env(env_path: str = ".env") -> dict[str, str]:
 def check_dependencies():
     missing = []
     for mod, pkg in [
-        ("google_auth_oauthlib", "google-auth-oauthlib"),
-        ("googleapiclient", "google-api-python-client"),
+        ("gkeepapi", "gkeepapi"),
+        ("gpsoauth", "gpsoauth"),
         ("ourgroceries", "ourgroceries"),
     ]:
         try:
@@ -59,152 +63,149 @@ def check_dependencies():
     if missing:
         print("❌ Dépendances Python manquantes :", ", ".join(missing))
         print("\nInstallez-les avec la commande suivante :")
-        print("    pip install -r requirements.txt google-auth-oauthlib\n")
+        print("    pip install -r requirements.txt gpsoauth\n")
         sys.exit(1)
 
 
-def setup_google_tasks(existing_env: dict[str, str]) -> tuple[str, str, str, str]:
-    """Configure OAuth2 Google Tasks et retourne (client_id, client_secret, refresh_token, task_list_id)."""
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
+def setup_google_keep(existing_env: dict[str, str]) -> tuple[str, str, str]:
+    """Configure Google Keep et retourne (email, master_token, note_id)."""
+    import gkeepapi
+    import gpsoauth
 
-    scopes = ["https://www.googleapis.com/auth/tasks"]
     print("\n" + "=" * 65)
-    print(" ÉTAPE 1/3 : Configuration Google Tasks (OAuth2)")
+    print(" ÉTAPE 1/4 : Configuration Google Keep")
     print("=" * 65)
 
-    client_id = existing_env.get("GOOGLE_CLIENT_ID", "")
-    client_secret = existing_env.get("GOOGLE_CLIENT_SECRET", "")
-    refresh_token = existing_env.get("GOOGLE_REFRESH_TOKEN", "")
-    current_task_list_id = existing_env.get("GOOGLE_TASK_LIST_ID", "")
+    default_email = existing_env.get("GOOGLE_KEEP_EMAIL") or existing_env.get(
+        "OG_USERNAME", ""
+    )
+    existing_token = existing_env.get("GOOGLE_KEEP_MASTER_TOKEN", "")
+    current_note_id = existing_env.get("GOOGLE_KEEP_NOTE_ID", "")
 
-    creds = None
+    keep = gkeepapi.Keep()
+    keep_email = default_email
+    master_token = existing_token
+    authenticated = False
 
-    # Si un Refresh Token existe déjà dans .env, proposer de le réutiliser
-    if client_id and client_secret and refresh_token:
+    if keep_email and master_token:
         reuse = (
             input(
-                "🔄 Identifiants Google détectés dans .env. Les réutiliser sans rouvrir le navigateur ? [O/n] : "
+                f"🔄 Token Google Keep détecté dans .env pour '{keep_email}'. Le réutiliser ? [O/n] : "
             )
             .strip()
             .lower()
         )
         if reuse in ("", "o", "oui", "y", "yes"):
             try:
-                creds = Credentials(
-                    token=None,
-                    refresh_token=refresh_token,
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    scopes=scopes,
-                )
-                creds.refresh(Request())
-                print("✅ Connexion Google Tasks existante validée !")
+                print("🔄 Connexion à Google Keep en cours...")
+                keep.authenticate(keep_email, master_token)
+                authenticated = True
+                print("✅ Connexion Google Keep existante validée !")
             except Exception as exc:
                 print(f"⚠️ Impossible de réutiliser le token existant ({exc}). Reconnexion...")
-                creds = None
+                authenticated = False
 
-    if creds is None:
-        # Recherche automatique d'un fichier credentials.json ou client_secret*.json
-        candidate_files = glob.glob("credentials.json") + glob.glob("client_secret*.json")
-        client_config = None
-
-        if candidate_files:
-            chosen_file = candidate_files[0]
-            print(f"📄 Fichier d'identifiants détecté : {chosen_file}")
-            with open(chosen_file, "r", encoding="utf-8") as f:
-                client_config = json.load(f)
-            section = client_config.get("installed") or client_config.get("web") or {}
-            client_id = section.get("client_id", client_id)
-            client_secret = section.get("client_secret", client_secret)
-        else:
-            prompt_cid = (
-                f"👉 GOOGLE_CLIENT_ID [{client_id[:20]}...] : "
-                if client_id
-                else "👉 GOOGLE_CLIENT_ID : "
-            )
-            client_id_in = input(prompt_cid).strip() or client_id
-
-            prompt_csec = (
-                "👉 GOOGLE_CLIENT_SECRET [Entrée pour conserver celui du .env] : "
-                if client_secret
-                else "👉 GOOGLE_CLIENT_SECRET : "
-            )
-            client_secret_in = input(prompt_csec).strip() or client_secret
-
-            if not client_id_in or not client_secret_in:
-                print("❌ Client ID et Client Secret requis.")
-                sys.exit(1)
-
-            client_id = client_id_in
-            client_secret = client_secret_in
-            client_config = {
-                "installed": {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["http://localhost"],
-                }
-            }
-
-        print("\n🌐 Ouverture du navigateur pour autoriser l'accès à Google Tasks...")
-        flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
-        creds = flow.run_local_server(
-            port=0,
-            access_type="offline",
-            prompt="consent",
+    while not authenticated:
+        email_prompt = (
+            f"\n👉 Adresse e-mail Google Keep [{default_email}] : "
+            if default_email
+            else "\n👉 Adresse e-mail Google Keep (GOOGLE_KEEP_EMAIL) : "
         )
-
-        if not creds.refresh_token:
-            print(
-                "⚠️ Aucun refresh_token reçu. Réessayez en révoquant l'accès sur "
-                "https://myaccount.google.com/permissions"
-            )
+        keep_email = input(email_prompt).strip() or default_email
+        if not keep_email:
+            print("❌ L'adresse e-mail Google Keep est requise.")
             sys.exit(1)
 
-        refresh_token = creds.refresh_token
-        print("✅ Authentification Google réussie !")
+        print(
+            "\nPour obtenir votre Master Token permanent (une seule fois) :\n"
+            "  1. Ouvrez https://accounts.google.com/EmbeddedSetup dans votre navigateur\n"
+            "     et connectez-vous avec votre compte Google (cliquez sur 'J'accepte' ;\n"
+            "     il est normal que la page finale mouline sans fin).\n"
+            "  2. Ouvrez les outils de développement (F12) -> onglet Application (Chrome/Edge)\n"
+            "     ou Stockage (Firefox) -> Cookies -> https://accounts.google.com\n"
+            "  3. Copiez la valeur du cookie nommé 'oauth_token' (commence par oauth2_4/...).\n"
+            "     (Vous pouvez aussi coller directement un Master Token aas_et/... existant.)"
+        )
 
-    service = build("tasks", "v1", credentials=creds, cache_discovery=False)
-    res = service.tasklists().list(maxResults=100).execute()
-    tasklists = res.get("items", [])
+        open_browser = (
+            input("\n🌐 Ouvrir https://accounts.google.com/EmbeddedSetup maintenant ? [O/n] : ")
+            .strip()
+            .lower()
+        )
+        if open_browser in ("", "o", "oui", "y", "yes"):
+            webbrowser.open("https://accounts.google.com/EmbeddedSetup")
 
+        token_input = input(
+            "\n👉 Collez le cookie 'oauth_token' (oauth2_4/...) ou Master Token (aas_et/...) : "
+        ).strip().strip('"').strip("'")
+
+        if not token_input:
+            print("❌ Jeton requis.")
+            continue
+
+        if token_input.startswith("aas_et/"):
+            master_token = token_input
+        else:
+            print("🔄 Échange du cookie oauth_token contre un Master Token permanent...")
+            exchange = gpsoauth.exchange_token(
+                keep_email, token_input, "0123456789abcdef"
+            )
+            if "Token" not in exchange:
+                print(f"❌ Échec de l'échange : {exchange}")
+                continue
+            master_token = exchange["Token"]
+            print("✅ Master Token généré avec succès !")
+
+        try:
+            print("🔄 Connexion et synchronisation Google Keep...")
+            keep.authenticate(keep_email, master_token)
+            authenticated = True
+            print("✅ Authentification Google Keep réussie !")
+        except Exception as exc:
+            print(f"❌ Échec de connexion Google Keep : {exc}")
+
+    notes = [n for n in keep.all() if not getattr(n, "trashed", False)]
     default_choice = 1
-    print("\n📋 Vos listes Google Tasks disponibles :")
-    print("  [0] ➕ Créer une nouvelle liste Google Tasks")
-    for idx, tl in enumerate(tasklists, start=1):
+    print("\n📝 Vos listes et notes Google Keep disponibles :")
+    print("  [0] ➕ Créer une nouvelle liste Google Keep")
+    for idx, note in enumerate(notes, start=1):
+        title = (getattr(note, "title", "") or "").strip() or "(Sans titre)"
+        if hasattr(note, "unchecked") and hasattr(note, "checked"):
+            info = f"({len(note.unchecked)} non cochés, {len(note.checked)} cochés)"
+        else:
+            info = "(note texte — pas de cases à cocher)"
+
         marker = ""
-        if tl["id"] == current_task_list_id:
+        if note.id == current_note_id:
             default_choice = idx
             marker = "  👈 (actuel dans .env)"
-        print(f"  [{idx}] {tl['title']}  (ID: {tl['id']}){marker}")
+
+        print(f"  [{idx}] {title}  {info} — ID: {note.id}{marker}")
 
     choice = input(
         f"\n👉 Choisissez le numéro de la liste à surveiller [{default_choice}] : "
     ).strip()
-    if choice == "0":
+    if choice == "0" or not notes:
         new_name = (
-            input("Nom de la nouvelle liste Google Tasks (ex: Courses) : ").strip()
-            or "Courses"
+            input("Nom de la nouvelle liste Google Keep (ex: Liste de courses) : ").strip()
+            or "Liste de courses"
         )
-        created = service.tasklists().insert(body={"title": new_name}).execute()
-        task_list_id = created["id"]
-        print(f"✅ Liste '{created['title']}' créée avec l'ID : {task_list_id}")
+        created = keep.createList(new_name, [])
+        keep.sync()
+        note_id = created.id
+        print(f"✅ Liste '{created.title}' créée avec l'ID : {note_id}")
     else:
         idx = (
             int(choice) - 1
-            if choice.isdigit() and 1 <= int(choice) <= len(tasklists)
+            if choice.isdigit() and 1 <= int(choice) <= len(notes)
             else default_choice - 1
         )
-        selected = tasklists[idx]
-        task_list_id = selected["id"]
-        print(f"✅ Liste sélectionnée : '{selected['title']}' (ID: {task_list_id})")
+        selected = notes[idx]
+        note_id = selected.id
+        selected_title = (getattr(selected, "title", "") or "").strip() or "(Sans titre)"
+        print(f"✅ Liste sélectionnée : '{selected_title}' (ID: {note_id})")
 
-    return client_id, client_secret, refresh_token, task_list_id
+    return keep_email, master_token, note_id
 
 
 async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, str]:
@@ -212,7 +213,7 @@ async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, st
     from ourgroceries import OurGroceries
 
     print("\n" + "=" * 65)
-    print(" ÉTAPE 2/3 : Configuration OurGroceries")
+    print(" ÉTAPE 2/4 : Configuration OurGroceries")
     print("=" * 65)
 
     default_user = existing_env.get("OG_USERNAME", "")
@@ -286,6 +287,99 @@ async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, st
     return og_user, og_pass, og_list_id
 
 
+def test_gemini_api_key(api_key: str, model: str = "gemini-3.8-flash") -> bool:
+    """
+    Valide la clé API Gemini via /v1beta/models (rapide et insensible aux pics 503
+    d'un modèle précis), avec repli sur generateContent si nécessaire.
+    """
+    models_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={quote(api_key, safe='')}"
+    )
+    try:
+        with urllib.request.urlopen(models_url, timeout=15) as resp:
+            models_data = json.loads(resp.read().decode("utf-8"))
+        if models_data.get("models"):
+            return True
+    except urllib.error.HTTPError as http_err:
+        err_body = http_err.read().decode("utf-8", errors="replace")
+        if http_err.code != 503:
+            print(f"⚠️ Clé API Gemini invalide (HTTP {http_err.code}) : {err_body[:200]}")
+            return False
+    except Exception:
+        pass
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{quote(model, safe='')}:generateContent?key={quote(api_key, safe='')}"
+    )
+    payload: dict = {"contents": [{"parts": [{"text": "Réponds uniquement par OK."}]}]}
+    if model.startswith("gemini-3"):
+        payload["generationConfig"] = {"thinkingConfig": {"thinkingLevel": "low"}}
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return bool(data.get("candidates"))
+    except urllib.error.HTTPError as http_err:
+        if http_err.code == 503:
+            # 503 signifie que la clé est authentifiée, le modèle est simplement saturé
+            print("ℹ️ Clé API reconnue (modèle temporairement saturé HTTP 503, la bascule auto gérera).")
+            return True
+        err_body = http_err.read().decode("utf-8", errors="replace")
+        print(f"⚠️ Erreur API Gemini (HTTP {http_err.code}) : {err_body[:200]}")
+        return False
+    except Exception as exc:
+        print(f"⚠️ Impossible de contacter l'API Gemini : {exc}")
+        return False
+
+
+def setup_gemini(existing_env: dict[str, str]) -> str:
+    """Configure optionnellement la clé gratuite Google AI Studio (GEMINI_API_KEY)."""
+    print("\n" + "=" * 65)
+    print(" ÉTAPE 3/4 : Configuration Gemini AI (Smart Matching)")
+    print("=" * 65)
+    print(
+        "Pour un matching intelligent (marques habituelles comme 'Lait' -> 'lait cawol',\n"
+        "synonymes comme 'Sopalin' -> 'Essuie-tout', fautes de dictée vocale),\n"
+        "générez une clé API 100 % gratuite (sans carte bancaire) sur :\n"
+        "  👉 https://aistudio.google.com/apikey  (bouton 'Create API key')\n"
+        "(Laissez vide et appuyez sur Entrée pour utiliser uniquement le matching local.)"
+    )
+
+    default_key = existing_env.get("GEMINI_API_KEY", "")
+    model = existing_env.get("GEMINI_MODEL", "gemini-3.8-flash") or "gemini-3.8-flash"
+
+    while True:
+        if default_key:
+            masked = f"{default_key[:8]}...{default_key[-4:]}" if len(default_key) > 12 else "***"
+            prompt = f"\n👉 GEMINI_API_KEY [{masked} — Entrée pour conserver] : "
+        else:
+            prompt = "\n👉 GEMINI_API_KEY (optionnel) : "
+
+        entered = input(prompt).strip()
+        api_key = entered or default_key
+
+        if not api_key:
+            print("ℹ️ Aucune clé Gemini renseignée : le matching algorithmique local sera utilisé.")
+            return ""
+
+        print(f"🔄 Test de la clé API avec le modèle {model}...")
+        if test_gemini_api_key(api_key, model=model):
+            print(f"✅ Clé Gemini validée ({model}) !")
+            return api_key
+
+        retry = input("Voulez-vous saisir une autre clé ? [O/n] : ").strip().lower()
+        if retry in ("n", "non", "no"):
+            print("⚠️ Clé conservée malgré l'échec du test.")
+            return api_key
+        default_key = ""
+
+
 def main():
     check_dependencies()
 
@@ -294,45 +388,56 @@ def main():
     if existing_env:
         print("📂 Fichier .env existant détecté : ses valeurs seront proposées par défaut.")
 
-    client_id, client_secret, refresh_token, task_list_id = setup_google_tasks(
-        existing_env
-    )
+    keep_email, keep_master_token, keep_note_id = setup_google_keep(existing_env)
     og_user, og_pass, og_list_id = asyncio.run(setup_ourgroceries(existing_env))
+    gemini_api_key = setup_gemini(existing_env)
 
     cron_secret = existing_env.get("CRON_SECRET") or secrets.token_urlsafe(24)
     match_cutoff = existing_env.get("MATCH_CUTOFF") or "0.75"
 
     env_lines = [
         "# Généré automatiquement par scripts/setup_wizard.py",
-        f'GOOGLE_CLIENT_ID="{client_id}"',
-        f'GOOGLE_CLIENT_SECRET="{client_secret}"',
-        f'GOOGLE_REFRESH_TOKEN="{refresh_token}"',
-        f'GOOGLE_TASK_LIST_ID="{task_list_id}"',
+        f'GOOGLE_KEEP_EMAIL="{keep_email}"',
+        f'GOOGLE_KEEP_MASTER_TOKEN="{keep_master_token}"',
+        f'GOOGLE_KEEP_NOTE_ID="{keep_note_id}"',
         f'OG_USERNAME="{og_user}"',
         f'OG_PASSWORD="{og_pass}"',
         f'OG_LIST_ID="{og_list_id}"',
+        f'GEMINI_API_KEY="{gemini_api_key}"',
         f'CRON_SECRET="{cron_secret}"',
         f'MATCH_CUTOFF="{match_cutoff}"',
-        "",
     ]
+
+    # Préserve d'éventuelles clés Google Tasks / GEMINI_MODEL existantes dans .env
+    for legacy_key in (
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+        "GOOGLE_TASK_LIST_ID",
+        "GEMINI_MODEL",
+    ):
+        if existing_env.get(legacy_key):
+            env_lines.append(f'{legacy_key}="{existing_env[legacy_key]}"')
+
+    env_lines.append("")
 
     with open(env_path, "w", encoding="utf-8") as f:
         f.write("\n".join(env_lines))
 
     print("\n" + "=" * 65)
-    print(" 🎉 ÉTAPE 3/3 : Configuration terminée !")
+    print(" 🎉 ÉTAPE 4/4 : Configuration terminée !")
     print("=" * 65)
     print(f"📁 Fichier local sauvegardé dans : {env_path} (ignoré par Git)")
     print("\n📋 Variables à copier dans Vercel (Settings > Environment Variables) :\n")
-    print(f"  GOOGLE_CLIENT_ID      = {client_id}")
-    print(f"  GOOGLE_CLIENT_SECRET  = {client_secret}")
-    print(f"  GOOGLE_REFRESH_TOKEN  = {refresh_token}")
-    print(f"  GOOGLE_TASK_LIST_ID   = {task_list_id}")
-    print(f"  OG_USERNAME           = {og_user}")
-    print(f"  OG_PASSWORD           = {og_pass}")
-    print(f"  OG_LIST_ID            = {og_list_id}")
-    print(f"  CRON_SECRET           = {cron_secret}")
-    print(f"  MATCH_CUTOFF          = {match_cutoff}")
+    print(f"  GOOGLE_KEEP_EMAIL        = {keep_email}")
+    print(f"  GOOGLE_KEEP_MASTER_TOKEN = {keep_master_token}")
+    print(f"  GOOGLE_KEEP_NOTE_ID      = {keep_note_id}")
+    print(f"  OG_USERNAME              = {og_user}")
+    print(f"  OG_PASSWORD              = {og_pass}")
+    print(f"  OG_LIST_ID               = {og_list_id}")
+    print(f"  GEMINI_API_KEY           = {gemini_api_key or '(non configuré — fallback local)'}")
+    print(f"  CRON_SECRET              = {cron_secret}")
+    print(f"  MATCH_CUTOFF             = {match_cutoff}")
     print("\n⏰ Sur cron-job.org, appelez toutes les 5 minutes :")
     print(f"  URL : https://VOTRE-PROJET.vercel.app/api/sync?secret={cron_secret}")
     print("=" * 65 + "\n")

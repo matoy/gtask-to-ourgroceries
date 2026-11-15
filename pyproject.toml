@@ -1,9 +1,10 @@
 [project]
 name = "gtask-to-ourgroceries"
 version = "0.1.0"
-description = "Serverless bridge from Google Tasks to OurGroceries"
+description = "Serverless bridge from Google Keep / Google Tasks to OurGroceries"
 requires-python = ">=3.11"
 dependencies = [
+    "gkeepapi>=0.16.0",
     "google-api-python-client>=2.118.0",
     "google-auth>=2.28.1",
     "google-auth-httplib2>=0.2.0",

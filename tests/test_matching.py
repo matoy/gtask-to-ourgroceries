@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import types
 
 for mod_name in [
+    "gkeepapi",
     "google",
     "google.auth",
     "google.auth.transport",
@@ -40,7 +41,7 @@ class TestFuzzyMatching(unittest.TestCase):
     def setUp(self):
         # Liste cible OurGroceries simulée (éléments actifs et barrés)
         self.og_items = [
-            {"id": "1", "value": "Lait demi-écrémé", "crossedOff": True},
+            {"id": "1", "value": "lait cawol", "crossedOff": True},
             {"id": "2", "value": "Tomates", "crossedOff": True},
             {"id": "3", "value": "Œufs", "crossedOff": False},
             {"id": "4", "value": "Pâtes", "crossedOff": True},
@@ -83,6 +84,14 @@ class TestFuzzyMatching(unittest.TestCase):
         item, score, name = parse_and_match_item("ajoute de l'huile d'olive", self.og_items)
         self.assertIsNotNone(item)
         self.assertEqual(name, "Huile d'olive")
+
+    def test_keyword_head_word_match(self):
+        # Mot directeur ("Lait" / "du lait" -> "lait cawol")
+        for raw in ("Lait", "du lait", "ajoute du lait"):
+            item, score, name = parse_and_match_item(raw, self.og_items)
+            self.assertIsNotNone(item)
+            self.assertEqual(name, "lait cawol")
+            self.assertGreaterEqual(score, 0.88)
 
     def test_new_item_fallback(self):
         # Nouvel article absent de la liste cible -> création avec majuscule propre
