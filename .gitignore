@@ -1,0 +1,25 @@
+# Environnement et secrets locaux
+.env
+.env.*
+!.env.example
+credentials.json
+client_secret*.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Vercel
+.vercel/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
