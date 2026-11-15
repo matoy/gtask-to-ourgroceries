@@ -20,6 +20,7 @@ import json
 import os
 import secrets
 import sys
+import time
 import urllib.error
 from urllib.parse import quote
 import urllib.request
@@ -287,33 +288,14 @@ async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, st
     return og_user, og_pass, og_list_id
 
 
-def test_gemini_api_key(api_key: str, model: str = "gemini-3.8-flash") -> bool:
-    """
-    Valide la clé API Gemini via /v1beta/models (rapide et insensible aux pics 503
-    d'un modèle précis), avec repli sur generateContent si nécessaire.
-    """
-    models_url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models?key={quote(api_key, safe='')}"
-    )
-    try:
-        with urllib.request.urlopen(models_url, timeout=15) as resp:
-            models_data = json.loads(resp.read().decode("utf-8"))
-        if models_data.get("models"):
-            return True
-    except urllib.error.HTTPError as http_err:
-        err_body = http_err.read().decode("utf-8", errors="replace")
-        if http_err.code != 503:
-            print(f"⚠️ Clé API Gemini invalide (HTTP {http_err.code}) : {err_body[:200]}")
-            return False
-    except Exception:
-        pass
-
+def test_gemini_api_key(api_key: str, model: str = "gemini-3.5-flash-lite") -> bool:
+    """Effectue un véritable appel generateContent pour valider la clé et le modèle."""
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{quote(model, safe='')}:generateContent?key={quote(api_key, safe='')}"
     )
     payload: dict = {"contents": [{"parts": [{"text": "Réponds uniquement par OK."}]}]}
-    if model.startswith("gemini-3"):
+    if model.startswith("gemini-3") and "lite" not in model:
         payload["generationConfig"] = {"thinkingConfig": {"thinkingLevel": "low"}}
     req = urllib.request.Request(
         endpoint,
@@ -321,17 +303,25 @@ def test_gemini_api_key(api_key: str, model: str = "gemini-3.8-flash") -> bool:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    start = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return bool(data.get("candidates"))
-    except urllib.error.HTTPError as http_err:
-        if http_err.code == 503:
-            # 503 signifie que la clé est authentifiée, le modèle est simplement saturé
-            print("ℹ️ Clé API reconnue (modèle temporairement saturé HTTP 503, la bascule auto gérera).")
+        elapsed_ms = round((time.perf_counter() - start) * 1000)
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print(f"⚠️ Aucun candidat renvoyé par {model} ({elapsed_ms} ms).")
+            return False
+        parts = candidates[0].get("content", {}).get("parts", [])
+        reply_text = "".join(part.get("text", "") for part in parts).strip()
+        if reply_text:
+            print(f"✅ Réponse reçue de {model} ({elapsed_ms} ms) : {reply_text}")
             return True
+        print(f"⚠️ Réponse vide de {model} ({elapsed_ms} ms).")
+        return False
+    except urllib.error.HTTPError as http_err:
         err_body = http_err.read().decode("utf-8", errors="replace")
-        print(f"⚠️ Erreur API Gemini (HTTP {http_err.code}) : {err_body[:200]}")
+        print(f"⚠️ Erreur API Gemini (HTTP {http_err.code}) : {err_body[:250]}")
         return False
     except Exception as exc:
         print(f"⚠️ Impossible de contacter l'API Gemini : {exc}")
@@ -352,7 +342,10 @@ def setup_gemini(existing_env: dict[str, str]) -> str:
     )
 
     default_key = existing_env.get("GEMINI_API_KEY", "")
-    model = existing_env.get("GEMINI_MODEL", "gemini-3.8-flash") or "gemini-3.8-flash"
+    model = (
+        existing_env.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        or "gemini-3.5-flash-lite"
+    )
 
     while True:
         if default_key:

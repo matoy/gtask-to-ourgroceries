@@ -237,7 +237,7 @@ def match_tasks_with_gemini(
     raw_titles: list[str],
     og_items: list[dict],
     api_key: str,
-    model: str = "gemini-3.8-flash",
+    model: str = "gemini-3.5-flash-lite",
 ) -> list[dict]:
     """
     Appelle l'API Gemini Flash pour réconcilier intelligemment en un seul batch
@@ -308,8 +308,9 @@ def match_tasks_with_gemini(
 
     fallback_models = [
         model,
-        "gemini-3.8-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
+        "gemini-3.8-flash",
         "gemini-flash-latest",
     ]
     candidate_models = list(dict.fromkeys(m for m in fallback_models if m))
@@ -323,7 +324,7 @@ def match_tasks_with_gemini(
             f"{quote(candidate_model, safe='')}:generateContent?key={quote(api_key, safe='')}"
         )
         generation_config = dict(base_generation_config)
-        if candidate_model.startswith("gemini-3"):
+        if candidate_model.startswith("gemini-3") and "lite" not in candidate_model:
             generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
 
         request_body = {
@@ -496,7 +497,7 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
 
     cutoff = float(get_env_clean("MATCH_CUTOFF", "0.75") or "0.75")
     gemini_api_key = get_env_clean("GEMINI_API_KEY")
-    gemini_model = get_env_clean("GEMINI_MODEL", "gemini-3.8-flash") or "gemini-3.8-flash"
+    gemini_model = get_env_clean("GEMINI_MODEL", "gemini-3.5-flash-lite") or "gemini-3.5-flash-lite"
 
     # 1. Récupération des articles non cochés depuis Google Keep (prioritaire) ou Google Tasks
     keep_master_token = get_env_clean("GOOGLE_KEEP_MASTER_TOKEN")

@@ -97,7 +97,7 @@ L'assistant va vous guider pas à pas pour :
 | `OG_PASSWORD` | Mot de passe OurGroceries |
 | `OG_LIST_ID` | ID de la liste de courses OurGroceries cible |
 | `GEMINI_API_KEY` | *(Recommandé, gratuit)* Clé Google AI Studio pour le matching intelligent |
-| `GEMINI_MODEL` | *(Optionnel)* Modèle Gemini utilisé (défaut : `gemini-3.8-flash`) |
+| `GEMINI_MODEL` | *(Optionnel)* Modèle Gemini utilisé (défaut : `gemini-3.5-flash-lite`) |
 | `CRON_SECRET` | Jeton secret protégeant l'endpoint `/api/sync` |
 | `MATCH_CUTOFF` | *(Optionnel)* Seuil de similarité de secours entre `0.0` et `1.0` (défaut : `0.75`) |
 
