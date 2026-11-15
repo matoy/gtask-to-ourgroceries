@@ -13,3 +13,16 @@ dependencies = [
 
 [tool.vercel]
 entrypoint = "api.sync:handler"
+
+[tool.pyrefly]
+search-path = ["."]
+ignore-missing-imports = [
+    "gkeepapi",
+    "gkeepapi.*",
+    "google.*",
+    "googleapiclient.*",
+    "gpsoauth",
+    "gpsoauth.*",
+    "ourgroceries",
+    "ourgroceries.*",
+]

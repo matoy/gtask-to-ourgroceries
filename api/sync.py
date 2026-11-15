@@ -1,11 +1,13 @@
 import asyncio
+from collections.abc import Callable
 from difflib import SequenceMatcher
-from functools import lru_cache
+from functools import lru_cache, partial
 from http.server import BaseHTTPRequestHandler
 import hmac
 import json
 import os
 import re
+from typing import Any
 import unicodedata
 from urllib.parse import parse_qs, quote, urlparse
 import urllib.error
@@ -123,7 +125,7 @@ def split_crossed_off_for_cleanup(
     Sépare les articles rayés entre ceux à conserver (les `keep_count` plus récents
     selon `crossedOffAt`) et les plus anciens à supprimer.
     """
-    keep_n = max(0, int(keep_count))
+    keep_n = max(0, keep_count)
     crossed_items = [item for item in og_items if is_item_crossed_off(item)]
     crossed_sorted = sorted(
         crossed_items,
@@ -484,14 +486,14 @@ def get_google_tasks_service():
 
 
 # Cache en mémoire du client Google Keep pour les exécutions successives ("Warm Container")
-_KEEP_CACHE: dict[str, object] = {
+_KEEP_CACHE: dict[str, Any] = {
     "email": None,
     "master_token": None,
     "client": None,
 }
 
 
-def get_google_keep_pending_items() -> tuple[object, list[dict]]:
+def get_google_keep_pending_items() -> tuple[Any, list[dict]]:
     """
     Authentifie (ou rafraîchit via sync incrémentale) le client Google Keep
     via Master Token et retourne : (keep_client, liste_des_articles_non_cochés).
@@ -576,13 +578,16 @@ def get_google_keep_pending_items() -> tuple[object, list[dict]]:
     return keep, pending_items
 
 
-async def _gather_bounded(coro_factories: list, limit: int = 5) -> None:
+async def _gather_bounded(
+    coro_factories: list[Callable[[], Any]],
+    limit: int = 5,
+) -> None:
     """Exécute des appels réseau asynchrones en parallèle avec une concurrence bornée."""
     if not coro_factories:
         return
     sem = asyncio.Semaphore(limit)
 
-    async def _run_one(factory):
+    async def _run_one(factory: Callable[[], Any]) -> Any:
         async with sem:
             return await factory()
 
@@ -661,8 +666,8 @@ async def sync_tasks_to_groceries(
 
     # 1. Récupération des articles non cochés depuis Google Keep (prioritaire) ou Google Tasks
     keep_master_token = get_env_clean("GOOGLE_KEEP_MASTER_TOKEN")
-    keep_client = None
-    tasks_service = None
+    keep_client: Any = None
+    tasks_service: Any = None
     task_list_id = ""
 
     if keep_master_token:
@@ -740,12 +745,12 @@ async def sync_tasks_to_groceries(
         )
         if items_to_delete:
             deleted_mem_ids = {id(item) for item in items_to_delete}
-            delete_tasks = []
+            delete_tasks: list[Callable[[], Any]] = []
             for item in items_to_delete:
                 item_id = item.get("id")
                 if not dry_run and item_id:
                     delete_tasks.append(
-                        lambda lid=og_list_id, iid=item_id: og.remove_item_from_list(lid, iid)
+                        partial(og.remove_item_from_list, og_list_id, item_id)
                     )
                 deleted_crossed_off_items.append(
                     {
@@ -799,7 +804,7 @@ async def sync_tasks_to_groceries(
 
     # 4. Traitement de chaque tâche et préparation des écritures OurGroceries
     processed_items = []
-    og_write_tasks = []
+    og_write_tasks: list[Callable[[], Any]] = []
     tasks_to_mark_done = []
 
     for idx, task in enumerate(pending_tasks):
@@ -869,9 +874,10 @@ async def sync_tasks_to_groceries(
                 if not dry_run and matched_item.get("id"):
                     item_id = matched_item["id"]
                     og_write_tasks.append(
-                        lambda lid=og_list_id, iid=item_id: og.toggle_item_crossed_off(
-                            list_id=lid,
-                            item_id=iid,
+                        partial(
+                            og.toggle_item_crossed_off,
+                            list_id=og_list_id,
+                            item_id=item_id,
                             cross_off=False,
                         )
                     )
@@ -884,9 +890,10 @@ async def sync_tasks_to_groceries(
             if not dry_run:
                 item_val = target_name
                 og_write_tasks.append(
-                    lambda lid=og_list_id, val=item_val: og.add_item_to_list(
-                        list_id=lid,
-                        value=val,
+                    partial(
+                        og.add_item_to_list,
+                        list_id=og_list_id,
+                        value=item_val,
                         auto_category=True,
                     )
                 )
@@ -918,7 +925,7 @@ async def sync_tasks_to_groceries(
                     task["_keep_item"].checked = True
                 if keep_client is not None:
                     keep_client.sync()
-            else:
+            elif tasks_service is not None:
                 for task in tasks_to_mark_done:
                     tasks_service.tasks().patch(
                         tasklist=task_list_id,
