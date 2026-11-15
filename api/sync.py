@@ -148,11 +148,24 @@ def parse_and_match_item(
     return None, round(best_score, 3), formatted_name
 
 
+def get_env_clean(key: str, default: str = "") -> str:
+    """Lit une variable d'environnement en supprimant espaces et guillemets éventuels."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    val = raw.strip()
+    if len(val) >= 2 and (
+        (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")
+    ):
+        val = val[1:-1].strip()
+    return val
+
+
 def get_google_tasks_service():
     """Construit le client Google Tasks API via OAuth2 Refresh Token."""
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
+    client_id = get_env_clean("GOOGLE_CLIENT_ID")
+    client_secret = get_env_clean("GOOGLE_CLIENT_SECRET")
+    refresh_token = get_env_clean("GOOGLE_REFRESH_TOKEN")
 
     if not all([client_id, client_secret, refresh_token]):
         raise ValueError(
@@ -181,19 +194,19 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
     3. Décoche l'article existant ou crée le nouvel article dans OurGroceries.
     4. Marque la tâche comme terminée dans Google Tasks.
     """
-    task_list_id = os.environ.get("GOOGLE_TASK_LIST_ID")
+    task_list_id = get_env_clean("GOOGLE_TASK_LIST_ID")
     if not task_list_id:
         raise ValueError("Variable GOOGLE_TASK_LIST_ID manquante.")
 
-    og_user = os.environ.get("OG_USERNAME")
-    og_pass = os.environ.get("OG_PASSWORD")
-    og_list_id = os.environ.get("OG_LIST_ID")
+    og_user = get_env_clean("OG_USERNAME")
+    og_pass = get_env_clean("OG_PASSWORD")
+    og_list_id = get_env_clean("OG_LIST_ID")
     if not all([og_user, og_pass, og_list_id]):
         raise ValueError(
             "Variables OurGroceries manquantes : OG_USERNAME, OG_PASSWORD et OG_LIST_ID sont requis."
         )
 
-    cutoff = float(os.environ.get("MATCH_CUTOFF", "0.75"))
+    cutoff = float(get_env_clean("MATCH_CUTOFF", "0.75") or "0.75")
 
     # 1. Récupération des tâches non cochées dans Google Tasks
     tasks_service = get_google_tasks_service()
@@ -218,9 +231,46 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
 
     # 2. Connexion à OurGroceries et lecture des éléments de la liste cible
     og = OurGroceries(og_user, og_pass)
-    await og.login()
+    try:
+        await og.login()
+    except Exception as login_err:
+        raise RuntimeError(
+            f"Échec de connexion OurGroceries (login) pour '{og_user}' : {login_err}"
+        ) from login_err
 
-    list_details = await og.get_list_items(list_id=og_list_id)
+    try:
+        list_details = await og.get_list_items(list_id=og_list_id)
+    except Exception as list_err:
+        try:
+            lists_response = await og.get_my_lists()
+            shopping_lists = lists_response.get("shoppingLists", [])
+        except Exception as my_lists_err:
+            raise RuntimeError(
+                f"Échec OurGroceries get_list_items(OG_LIST_ID='{og_list_id}') : {list_err} ; "
+                f"et échec get_my_lists() : {my_lists_err}"
+            ) from list_err
+
+        matched_list = next(
+            (
+                sl
+                for sl in shopping_lists
+                if sl.get("name", "").strip().lower() == og_list_id.lower()
+            ),
+            None,
+        )
+        if matched_list is not None:
+            og_list_id = matched_list["id"]
+            list_details = await og.get_list_items(list_id=og_list_id)
+        else:
+            available = ", ".join(
+                f"'{sl.get('name', '?')}' (id={sl.get('id', '?')})"
+                for sl in shopping_lists
+            ) or "aucune liste trouvée"
+            raise ValueError(
+                f"OG_LIST_ID='{og_list_id}' invalide ou introuvable ({list_err}). "
+                f"Listes OurGroceries disponibles : {available}"
+            ) from list_err
+
     og_items = list_details.get("list", {}).get("items", [])
 
     # 3. Traitement de chaque tâche
@@ -290,7 +340,7 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
 
 def is_authorized(headers, query_params: dict) -> bool:
     """Vérifie le jeton CRON_SECRET s'il est configuré dans les variables d'environnement."""
-    expected_secret = os.environ.get("CRON_SECRET", "").strip()
+    expected_secret = get_env_clean("CRON_SECRET")
     if not expected_secret:
         return True
 
