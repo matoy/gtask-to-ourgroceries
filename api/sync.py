@@ -85,6 +85,15 @@ def format_new_item_name(cleaned_name: str) -> str:
     return cleaned_name[0].upper() + cleaned_name[1:]
 
 
+def is_item_crossed_off(item: dict) -> bool:
+    """
+    Vérifie si un article OurGroceries est barré.
+    L'API OurGroceries utilise principalement 'crossedOffAt' (timestamp)
+    et parfois 'crossedOff' (booléen).
+    """
+    return bool(item.get("crossedOffAt") or item.get("crossedOff"))
+
+
 def parse_and_match_item(
     raw_task_name: str,
     og_items: list[dict],
@@ -127,8 +136,8 @@ def parse_and_match_item(
         if score > best_score or (
             score == best_score
             and best_item is not None
-            and item.get("crossedOff", False)
-            and not best_item.get("crossedOff", False)
+            and is_item_crossed_off(item)
+            and not is_item_crossed_off(best_item)
         ):
             best_score = score
             best_item = item
@@ -226,7 +235,7 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
             continue
 
         if matched_item is not None:
-            is_crossed_off = bool(matched_item.get("crossedOff", False))
+            is_crossed_off = is_item_crossed_off(matched_item)
             if is_crossed_off:
                 action = "uncrossed_existing"
                 if not dry_run and matched_item.get("id"):
@@ -236,6 +245,7 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
                         cross_off=False,
                     )
                 matched_item["crossedOff"] = False
+                matched_item["crossedOffAt"] = None
             else:
                 action = "already_active"
         else:
@@ -247,7 +257,9 @@ async def sync_tasks_to_groceries(dry_run: bool = False) -> dict:
                     auto_category=True,
                 )
             # Ajout en mémoire pour éviter un doublon si le même article apparaît 2 fois dans le lot
-            og_items.append({"id": None, "value": target_name, "crossedOff": False})
+            og_items.append(
+                {"id": None, "value": target_name, "crossedOff": False, "crossedOffAt": None}
+            )
 
         # 4. Marquer la tâche comme "Terminée" dans Google Tasks
         if not dry_run:

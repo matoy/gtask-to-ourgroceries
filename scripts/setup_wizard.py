@@ -2,11 +2,11 @@
 """
 Assistant d'initialisation interactif pour gtask-to-ourgroceries.
 
-Ce script s'exécute UNE SEULE FOIS sur votre ordinateur pour :
-1. Obtenir votre GOOGLE_REFRESH_TOKEN via OAuth2 (ouverture du navigateur).
+Ce script permet de :
+1. Obtenir (ou réutiliser depuis .env) votre GOOGLE_REFRESH_TOKEN via OAuth2.
 2. Lister vos listes Google Tasks et récupérer votre GOOGLE_TASK_LIST_ID.
 3. Tester la connexion OurGroceries et récupérer votre OG_LIST_ID.
-4. Générer un CRON_SECRET aléatoire et sauvegarder toutes les clés dans un fichier .env,
+4. Générer (ou conserver) un CRON_SECRET et sauvegarder toutes les clés dans .env,
    prêt à être copié-collé dans les Environment Variables de Vercel.
 
 Prérequis :
@@ -20,6 +20,28 @@ import json
 import os
 import secrets
 import sys
+
+
+def load_existing_env(env_path: str = ".env") -> dict[str, str]:
+    """Charge les variables existantes du fichier .env s'il est présent."""
+    env_vars: dict[str, str] = {}
+    if not os.path.exists(env_path):
+        return env_vars
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if (val.startswith('"') and val.endswith('"')) or (
+                val.startswith("'") and val.endswith("'")
+            ):
+                val = val[1:-1]
+            env_vars[key] = val
+    return env_vars
 
 
 def check_dependencies():
@@ -41,8 +63,10 @@ def check_dependencies():
         sys.exit(1)
 
 
-def setup_google_tasks() -> tuple[str, str, str, str]:
+def setup_google_tasks(existing_env: dict[str, str]) -> tuple[str, str, str, str]:
     """Configure OAuth2 Google Tasks et retourne (client_id, client_secret, refresh_token, task_list_id)."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
@@ -51,83 +75,139 @@ def setup_google_tasks() -> tuple[str, str, str, str]:
     print(" ÉTAPE 1/3 : Configuration Google Tasks (OAuth2)")
     print("=" * 65)
 
-    # Recherche automatique d'un fichier credentials.json ou client_secret*.json
-    candidate_files = glob.glob("credentials.json") + glob.glob("client_secret*.json")
-    client_config = None
+    client_id = existing_env.get("GOOGLE_CLIENT_ID", "")
+    client_secret = existing_env.get("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = existing_env.get("GOOGLE_REFRESH_TOKEN", "")
+    current_task_list_id = existing_env.get("GOOGLE_TASK_LIST_ID", "")
 
-    if candidate_files:
-        chosen_file = candidate_files[0]
-        print(f"📄 Fichier d'identifiants détecté : {chosen_file}")
-        with open(chosen_file, "r", encoding="utf-8") as f:
-            client_config = json.load(f)
-    else:
-        print(
-            "Aucun fichier 'credentials.json' trouvé dans le dossier courant.\n"
-            "Vous pouvez soit déposer le JSON téléchargé depuis Google Cloud Console,\n"
-            "soit saisir directement votre Client ID et Client Secret ci-dessous."
+    creds = None
+
+    # Si un Refresh Token existe déjà dans .env, proposer de le réutiliser
+    if client_id and client_secret and refresh_token:
+        reuse = (
+            input(
+                "🔄 Identifiants Google détectés dans .env. Les réutiliser sans rouvrir le navigateur ? [O/n] : "
+            )
+            .strip()
+            .lower()
         )
-        client_id_in = input("\n👉 GOOGLE_CLIENT_ID : ").strip()
-        client_secret_in = input("👉 GOOGLE_CLIENT_SECRET : ").strip()
-        if not client_id_in or not client_secret_in:
-            print("❌ Client ID et Client Secret requis.")
-            sys.exit(1)
-        client_config = {
-            "installed": {
-                "client_id": client_id_in,
-                "client_secret": client_secret_in,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": ["http://localhost"],
+        if reuse in ("", "o", "oui", "y", "yes"):
+            try:
+                creds = Credentials(
+                    token=None,
+                    refresh_token=refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    scopes=scopes,
+                )
+                creds.refresh(Request())
+                print("✅ Connexion Google Tasks existante validée !")
+            except Exception as exc:
+                print(f"⚠️ Impossible de réutiliser le token existant ({exc}). Reconnexion...")
+                creds = None
+
+    if creds is None:
+        # Recherche automatique d'un fichier credentials.json ou client_secret*.json
+        candidate_files = glob.glob("credentials.json") + glob.glob("client_secret*.json")
+        client_config = None
+
+        if candidate_files:
+            chosen_file = candidate_files[0]
+            print(f"📄 Fichier d'identifiants détecté : {chosen_file}")
+            with open(chosen_file, "r", encoding="utf-8") as f:
+                client_config = json.load(f)
+            section = client_config.get("installed") or client_config.get("web") or {}
+            client_id = section.get("client_id", client_id)
+            client_secret = section.get("client_secret", client_secret)
+        else:
+            prompt_cid = (
+                f"👉 GOOGLE_CLIENT_ID [{client_id[:20]}...] : "
+                if client_id
+                else "👉 GOOGLE_CLIENT_ID : "
+            )
+            client_id_in = input(prompt_cid).strip() or client_id
+
+            prompt_csec = (
+                "👉 GOOGLE_CLIENT_SECRET [Entrée pour conserver celui du .env] : "
+                if client_secret
+                else "👉 GOOGLE_CLIENT_SECRET : "
+            )
+            client_secret_in = input(prompt_csec).strip() or client_secret
+
+            if not client_id_in or not client_secret_in:
+                print("❌ Client ID et Client Secret requis.")
+                sys.exit(1)
+
+            client_id = client_id_in
+            client_secret = client_secret_in
+            client_config = {
+                "installed": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
             }
-        }
 
-    # Extraction de client_id et client_secret
-    section = client_config.get("installed") or client_config.get("web") or {}
-    client_id = section.get("client_id", "")
-    client_secret = section.get("client_secret", "")
-
-    print("\n🌐 Ouverture du navigateur pour autoriser l'accès à Google Tasks...")
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
-    creds = flow.run_local_server(
-        port=0,
-        access_type="offline",
-        prompt="consent",
-    )
-
-    if not creds.refresh_token:
-        print(
-            "⚠️ Aucun refresh_token reçu. Réessayez en révoquant l'accès sur "
-            "https://myaccount.google.com/permissions"
+        print("\n🌐 Ouverture du navigateur pour autoriser l'accès à Google Tasks...")
+        flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
+        creds = flow.run_local_server(
+            port=0,
+            access_type="offline",
+            prompt="consent",
         )
-        sys.exit(1)
 
-    print("✅ Authentification Google réussie !")
+        if not creds.refresh_token:
+            print(
+                "⚠️ Aucun refresh_token reçu. Réessayez en révoquant l'accès sur "
+                "https://myaccount.google.com/permissions"
+            )
+            sys.exit(1)
+
+        refresh_token = creds.refresh_token
+        print("✅ Authentification Google réussie !")
 
     service = build("tasks", "v1", credentials=creds, cache_discovery=False)
     res = service.tasklists().list(maxResults=100).execute()
     tasklists = res.get("items", [])
 
+    default_choice = 1
     print("\n📋 Vos listes Google Tasks disponibles :")
     print("  [0] ➕ Créer une nouvelle liste Google Tasks")
     for idx, tl in enumerate(tasklists, start=1):
-        print(f"  [{idx}] {tl['title']}  (ID: {tl['id']})")
+        marker = ""
+        if tl["id"] == current_task_list_id:
+            default_choice = idx
+            marker = "  👈 (actuel dans .env)"
+        print(f"  [{idx}] {tl['title']}  (ID: {tl['id']}){marker}")
 
-    choice = input("\n👉 Choisissez le numéro de la liste à surveiller [1] : ").strip()
+    choice = input(
+        f"\n👉 Choisissez le numéro de la liste à surveiller [{default_choice}] : "
+    ).strip()
     if choice == "0":
-        new_name = input("Nom de la nouvelle liste Google Tasks (ex: Courses) : ").strip() or "Courses"
+        new_name = (
+            input("Nom de la nouvelle liste Google Tasks (ex: Courses) : ").strip()
+            or "Courses"
+        )
         created = service.tasklists().insert(body={"title": new_name}).execute()
         task_list_id = created["id"]
         print(f"✅ Liste '{created['title']}' créée avec l'ID : {task_list_id}")
     else:
-        idx = int(choice) - 1 if choice.isdigit() and int(choice) >= 1 else 0
+        idx = (
+            int(choice) - 1
+            if choice.isdigit() and 1 <= int(choice) <= len(tasklists)
+            else default_choice - 1
+        )
         selected = tasklists[idx]
         task_list_id = selected["id"]
         print(f"✅ Liste sélectionnée : '{selected['title']}' (ID: {task_list_id})")
 
-    return client_id, client_secret, creds.refresh_token, task_list_id
+    return client_id, client_secret, refresh_token, task_list_id
 
 
-async def setup_ourgroceries() -> tuple[str, str, str]:
+async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, str]:
     """Teste la connexion OurGroceries et retourne (username, password, list_id)."""
     from ourgroceries import OurGroceries
 
@@ -135,17 +215,33 @@ async def setup_ourgroceries() -> tuple[str, str, str]:
     print(" ÉTAPE 2/3 : Configuration OurGroceries")
     print("=" * 65)
 
-    og_user = input("👉 Adresse e-mail OurGroceries (OG_USERNAME) : ").strip()
+    default_user = existing_env.get("OG_USERNAME", "")
+    default_pass = existing_env.get("OG_PASSWORD", "")
+    current_og_list_id = existing_env.get("OG_LIST_ID", "")
+
+    user_prompt = (
+        f"👉 Adresse e-mail OurGroceries [{default_user}] : "
+        if default_user
+        else "👉 Adresse e-mail OurGroceries (OG_USERNAME) : "
+    )
+    og_user = input(user_prompt).strip() or default_user
+
+    pass_prompt = (
+        "👉 Mot de passe OurGroceries [Entrée pour conserver celui du .env] : "
+        if default_pass
+        else "👉 Mot de passe OurGroceries (OG_PASSWORD) : "
+    )
     try:
-        og_pass = getpass.getpass("👉 Mot de passe OurGroceries (OG_PASSWORD) : ").strip()
+        entered_pass = getpass.getpass(pass_prompt).strip()
     except Exception:
-        og_pass = input("👉 Mot de passe OurGroceries (OG_PASSWORD) : ").strip()
+        entered_pass = input(pass_prompt).strip()
+    og_pass = entered_pass or default_pass
 
     if not og_user or not og_pass:
         print("❌ Email et mot de passe OurGroceries requis.")
         sys.exit(1)
 
-    print("\n🔄 Connexion à OurGroceries en cours...")
+    print("\n🔄 Connexion à OurGroceries et lecture des listes en cours...")
     og = OurGroceries(og_user, og_pass)
     await og.login()
 
@@ -156,13 +252,33 @@ async def setup_ourgroceries() -> tuple[str, str, str]:
         print("❌ Aucune liste de courses trouvée sur ce compte OurGroceries.")
         sys.exit(1)
 
+    default_choice = 1
     print("\n🛒 Vos listes de courses OurGroceries :")
     for idx, sl in enumerate(shopping_lists, start=1):
-        active_count = sl.get("activeCount", 0)
-        print(f"  [{idx}] {sl['name']}  ({active_count} actifs) — ID: {sl['id']}")
+        details = await og.get_list_items(list_id=sl["id"])
+        items = details.get("list", {}).get("items", [])
+        crossed_count = sum(
+            1 for item in items if item.get("crossedOffAt") or item.get("crossedOff")
+        )
+        active_count = len(items) - crossed_count
 
-    choice = input("\n👉 Choisissez le numéro de la liste cible [1] : ").strip()
-    idx = int(choice) - 1 if choice.isdigit() and int(choice) >= 1 else 0
+        marker = ""
+        if sl["id"] == current_og_list_id:
+            default_choice = idx
+            marker = "  👈 (actuel dans .env)"
+
+        print(
+            f"  [{idx}] {sl['name']}  ({active_count} actifs, {crossed_count} barrés) — ID: {sl['id']}{marker}"
+        )
+
+    choice = input(
+        f"\n👉 Choisissez le numéro de la liste cible [{default_choice}] : "
+    ).strip()
+    idx = (
+        int(choice) - 1
+        if choice.isdigit() and 1 <= int(choice) <= len(shopping_lists)
+        else default_choice - 1
+    )
     selected = shopping_lists[idx]
     og_list_id = selected["id"]
     print(f"✅ Liste OurGroceries sélectionnée : '{selected['name']}' (ID: {og_list_id})")
@@ -173,9 +289,18 @@ async def setup_ourgroceries() -> tuple[str, str, str]:
 def main():
     check_dependencies()
 
-    client_id, client_secret, refresh_token, task_list_id = setup_google_tasks()
-    og_user, og_pass, og_list_id = asyncio.run(setup_ourgroceries())
-    cron_secret = secrets.token_urlsafe(24)
+    env_path = os.path.join(os.getcwd(), ".env")
+    existing_env = load_existing_env(env_path)
+    if existing_env:
+        print("📂 Fichier .env existant détecté : ses valeurs seront proposées par défaut.")
+
+    client_id, client_secret, refresh_token, task_list_id = setup_google_tasks(
+        existing_env
+    )
+    og_user, og_pass, og_list_id = asyncio.run(setup_ourgroceries(existing_env))
+
+    cron_secret = existing_env.get("CRON_SECRET") or secrets.token_urlsafe(24)
+    match_cutoff = existing_env.get("MATCH_CUTOFF") or "0.75"
 
     env_lines = [
         "# Généré automatiquement par scripts/setup_wizard.py",
@@ -187,11 +312,10 @@ def main():
         f'OG_PASSWORD="{og_pass}"',
         f'OG_LIST_ID="{og_list_id}"',
         f'CRON_SECRET="{cron_secret}"',
-        'MATCH_CUTOFF="0.75"',
+        f'MATCH_CUTOFF="{match_cutoff}"',
         "",
     ]
 
-    env_path = os.path.join(os.getcwd(), ".env")
     with open(env_path, "w", encoding="utf-8") as f:
         f.write("\n".join(env_lines))
 
@@ -208,7 +332,7 @@ def main():
     print(f"  OG_PASSWORD           = {og_pass}")
     print(f"  OG_LIST_ID            = {og_list_id}")
     print(f"  CRON_SECRET           = {cron_secret}")
-    print(f"  MATCH_CUTOFF          = 0.75")
+    print(f"  MATCH_CUTOFF          = {match_cutoff}")
     print("\n⏰ Sur cron-job.org, appelez toutes les 5 minutes :")
     print(f"  URL : https://VOTRE-PROJET.vercel.app/api/sync?secret={cron_secret}")
     print("=" * 65 + "\n")
