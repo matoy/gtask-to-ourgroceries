@@ -12,11 +12,11 @@ Il permet de parler naturellement à **Gemini for Home / Google Home** (*« Hey 
 [Gemini for Home / Google Home]
        │ (Vocal : "Ajoute du lait à ma liste de courses")
        ▼
-[Google Keep] (Liste tampon de courses)
+[Google Keep] (Une ou plusieurs listes tampon, personnelles ou partagées)
        │
        ▼  (Toutes les 5 min via cron-job.org -> GET /api/sync)
 [Vercel Serverless Function (Python)]
-  1. Lit les articles non cochés de la liste Google Keep via gkeepapi
+  1. Lit les articles non cochés des listes Google Keep configurées via gkeepapi
      (S'arrête immédiatement s'il n'y a aucun article : 0 appel Gemini à vide)
   2. Réconciliation intelligente via Gemini Flash (gratuit Google AI Studio)
      avec les éléments présents (actifs ou barrés) de la liste cible OurGroceries :
@@ -68,7 +68,7 @@ L'assistant va vous guider pas à pas pour :
 1. **Google Keep (`GOOGLE_KEEP_EMAIL`, `GOOGLE_KEEP_MASTER_TOKEN`, `GOOGLE_KEEP_NOTE_ID`)** :
    - Ouvrir `https://accounts.google.com/EmbeddedSetup` dans votre navigateur.
    - Récupérer une seule fois le cookie `oauth_token` (`F12 > Application > Cookies > https://accounts.google.com > oauth_token`) et le convertir automatiquement en Master Token permanent (`aas_et/...`).
-   - Afficher toutes vos listes Google Keep (avec le nombre d'articles cochés / non cochés) pour choisir celle utilisée par Google Home.
+   - Afficher toutes vos listes Google Keep — **personnelles comme partagées avec votre compte** — (avec le nombre d'articles cochés / non cochés) et en sélectionner **une ou plusieurs** (ex. `1,2`).
 2. **OurGroceries (`OG_USERNAME`, `OG_PASSWORD`, `OG_LIST_ID`)** :
    - Se connecter à votre compte et choisir la liste cible OurGroceries.
 3. **Gemini AI (`GEMINI_API_KEY`)** *(recommandé, gratuit)* :
@@ -92,7 +92,7 @@ L'assistant va vous guider pas à pas pour :
 | :--- | :--- |
 | `GOOGLE_KEEP_EMAIL` | Adresse e-mail du compte Google Keep |
 | `GOOGLE_KEEP_MASTER_TOKEN` | Master Token permanent (`aas_et/...`) généré par `setup_wizard.py` |
-| `GOOGLE_KEEP_NOTE_ID` | ID (ou titre exact) de la liste Google Keep à surveiller |
+| `GOOGLE_KEEP_NOTE_ID` | Un ou plusieurs IDs (ou titres exacts) de listes Google Keep séparés par des virgules (ex. `id1,id2`), y compris des listes partagées avec ce compte |
 | `OG_USERNAME` | Adresse e-mail de votre compte OurGroceries |
 | `OG_PASSWORD` | Mot de passe OurGroceries |
 | `OG_LIST_ID` | ID de la liste de courses OurGroceries cible |

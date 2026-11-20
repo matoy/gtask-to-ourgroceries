@@ -9,7 +9,7 @@ import os
 import re
 from typing import Any
 import unicodedata
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 import urllib.error
 import urllib.request
 
@@ -492,11 +492,383 @@ _KEEP_CACHE: dict[str, Any] = {
     "client": None,
 }
 
+KEEP_NOTE_URL_RE = re.compile(
+    r"^https?://keep\.google\.com/(?:u/\d+/)?#[a-z]+/([^/?#]+)",
+    re.IGNORECASE,
+)
 
-def get_google_keep_pending_items() -> tuple[Any, list[dict]]:
+
+def parse_keep_note_ids(raw_value: str) -> list[str]:
+    """
+    Découpe GOOGLE_KEEP_NOTE_ID en liste d'identifiants/titres normalisés
+    (séparés par virgules ou retours à la ligne, avec prise en charge des URL Keep).
+    """
+    if not raw_value:
+        return []
+
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,\r\n]+", raw_value):
+        token = part.strip()
+        if len(token) >= 2 and (
+            (token[0] == '"' and token[-1] == '"')
+            or (token[0] == "'" and token[-1] == "'")
+        ):
+            token = token[1:-1].strip()
+        if not token:
+            continue
+
+        url_match = KEEP_NOTE_URL_RE.match(token)
+        if url_match:
+            token = unquote(url_match.group(1)).strip()
+
+        if token and token not in seen:
+            seen.add(token)
+            identifiers.append(token)
+
+    return identifiers
+
+
+def describe_keep_note_sharing(note: Any, current_email: str = "") -> dict[str, Any]:
+    """Analyse l'état de partage (propriétaire, collaborateurs) d'une note Google Keep."""
+    collaborators = getattr(note, "collaborators", None)
+    current_norm = current_email.strip().lower()
+
+    all_emails: list[str] = []
+    seen_emails: set[str] = set()
+    owner_email: str | None = None
+    current_role: str | None = None
+
+    if collaborators is not None:
+        all_fn = getattr(collaborators, "all", None)
+        if callable(all_fn):
+            try:
+                entries = all_fn()
+            except Exception:
+                entries = []
+            for entry in entries or []:
+                email_str = (
+                    entry.strip()
+                    if isinstance(entry, str)
+                    else (getattr(entry, "email", "") or "").strip()
+                )
+                if email_str and email_str.lower() not in seen_emails:
+                    seen_emails.add(email_str.lower())
+                    all_emails.append(email_str)
+
+        raw_collab_map = getattr(collaborators, "_collaborators", None)
+        if isinstance(raw_collab_map, dict):
+            for raw_email, role in raw_collab_map.items():
+                email_str = (
+                    raw_email.strip()
+                    if isinstance(raw_email, str)
+                    else (getattr(raw_email, "email", "") or "").strip()
+                )
+                if not email_str:
+                    continue
+                role_val = getattr(role, "value", role)
+                if role_val == "O" and owner_email is None:
+                    owner_email = email_str
+                if current_norm and email_str.lower() == current_norm:
+                    current_role = str(role_val) if role_val is not None else None
+                if not callable(all_fn) and role_val in ("O", "W", "A"):
+                    if email_str.lower() not in seen_emails:
+                        seen_emails.add(email_str.lower())
+                        all_emails.append(email_str)
+
+    other_collaborators = [
+        email for email in all_emails if not current_norm or email.lower() != current_norm
+    ]
+    shared_with_me = bool(
+        (owner_email and current_norm and owner_email.lower() != current_norm)
+        or current_role == "W"
+    )
+    shared = bool(shared_with_me or other_collaborators)
+
+    return {
+        "shared": shared,
+        "shared_with_me": shared_with_me,
+        "owner": owner_email,
+        "collaborators": all_emails,
+        "other_collaborators": other_collaborators,
+    }
+
+
+def _format_keep_note_summary(note: Any, current_email: str = "") -> str:
+    """Formate une note Google Keep pour les messages d'erreur et de diagnostic."""
+    title = (getattr(note, "title", "") or "").strip() or "(sans titre)"
+    sharing = describe_keep_note_sharing(note, current_email=current_email)
+    tags: list[str] = []
+    if sharing["shared_with_me"]:
+        if sharing["owner"]:
+            tags.append(f"[partagée par {sharing['owner']}]")
+        else:
+            tags.append("[partagée avec vous]")
+    elif sharing["other_collaborators"]:
+        tags.append(f"[partagée avec {', '.join(sharing['other_collaborators'])}]")
+    if getattr(note, "archived", False):
+        tags.append("[archivée]")
+    tag_str = f" {' '.join(tags)}" if tags else ""
+    return f"'{title}'{tag_str} (id={getattr(note, 'id', '?')})"
+
+
+def resolve_keep_notes(
+    keep: Any,
+    identifiers: list[str],
+    current_email: str = "",
+) -> list[Any]:
+    """
+    Résout une liste d'identifiants Google Keep (id, server_id ou titre exact)
+    en objets List dédupliqués, incluant les listes partagées avec le compte.
+    """
+    all_notes = [
+        n
+        for n in keep.all()
+        if not getattr(n, "trashed", False) and not getattr(n, "deleted", False)
+    ]
+    by_id: dict[str, Any] = {}
+    by_server_id: dict[str, Any] = {}
+    for note in all_notes:
+        nid = getattr(note, "id", None)
+        if nid:
+            by_id[nid] = note
+        sid = getattr(note, "server_id", None)
+        if sid:
+            by_server_id[sid] = note
+
+    resolved: list[Any] = []
+    seen_resolved_ids: set[str] = set()
+    non_checklists: list[Any] = []
+    seen_non_checklist_ids: set[str] = set()
+    missing: list[str] = []
+
+    def _record_candidate(candidate: Any) -> None:
+        cid = getattr(candidate, "id", None)
+        if not hasattr(candidate, "unchecked"):
+            if cid is None or cid not in seen_non_checklist_ids:
+                if cid is not None:
+                    seen_non_checklist_ids.add(cid)
+                non_checklists.append(candidate)
+            return
+        if cid is None or cid not in seen_resolved_ids:
+            if cid is not None:
+                seen_resolved_ids.add(cid)
+            resolved.append(candidate)
+
+    for ident in identifiers:
+        candidate = by_id.get(ident) or by_server_id.get(ident)
+        if candidate is None and hasattr(keep, "get"):
+            fetched = keep.get(ident)
+            if (
+                fetched is not None
+                and not getattr(fetched, "trashed", False)
+                and not getattr(fetched, "deleted", False)
+            ):
+                candidate = fetched
+
+        if candidate is not None:
+            _record_candidate(candidate)
+            continue
+
+        ident_lower = ident.strip().lower()
+        title_matches = [
+            n
+            for n in all_notes
+            if (getattr(n, "title", "") or "").strip().lower() == ident_lower
+        ]
+        if not title_matches:
+            missing.append(ident)
+            continue
+
+        checklist_matches = [n for n in title_matches if hasattr(n, "unchecked")]
+        if not checklist_matches:
+            for n in title_matches:
+                _record_candidate(n)
+            continue
+
+        active_matches = [
+            n for n in checklist_matches if not getattr(n, "archived", False)
+        ]
+        chosen = active_matches if active_matches else checklist_matches
+        for n in chosen:
+            _record_candidate(n)
+
+    if non_checklists:
+        bad = ", ".join(
+            f"'{getattr(n, 'title', '') or '(sans titre)'}' (id={getattr(n, 'id', '?')})"
+            for n in non_checklists
+        )
+        raise ValueError(
+            f"La ou les notes Google Keep suivantes ne sont pas des listes à cases à cocher : {bad}."
+        )
+
+    if missing:
+        available = ", ".join(
+            _format_keep_note_summary(n, current_email=current_email)
+            for n in all_notes
+        ) or "aucune note trouvée"
+        missing_str = ", ".join(f"'{m}'" for m in missing)
+        raise ValueError(
+            f"GOOGLE_KEEP_NOTE_ID : liste(s) introuvable(s) dans Google Keep ({missing_str}). "
+            f"Notes disponibles : {available}"
+        )
+
+    return resolved
+
+
+def collect_keep_pending_items(
+    keep_notes: list[Any],
+    current_email: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """Extrait tous les articles non cochés et les métadonnées des listes Keep résolues."""
+    pending_items: list[dict] = []
+    keep_lists_meta: list[dict] = []
+
+    for note in keep_notes:
+        if not hasattr(note, "unchecked"):
+            raise ValueError(
+                f"La note Google Keep '{getattr(note, 'title', getattr(note, 'id', '?'))}' "
+                "n'est pas une liste à cases à cocher."
+            )
+
+        note_title = (getattr(note, "title", "") or "").strip() or "(sans titre)"
+        note_server_id = getattr(note, "server_id", None)
+        sharing = describe_keep_note_sharing(note, current_email=current_email)
+
+        note_pending: list[dict] = []
+        for item in note.unchecked:
+            text = (getattr(item, "text", "") or "").strip()
+            if not text:
+                continue
+            note_pending.append(
+                {
+                    "id": item.id,
+                    "title": text,
+                    "keep_note_id": note.id,
+                    "keep_note_server_id": note_server_id,
+                    "keep_note_title": note_title,
+                    "keep_item_server_id": getattr(item, "server_id", None),
+                    "_keep_item": item,
+                    "_keep_note": note,
+                }
+            )
+
+        pending_items.extend(note_pending)
+        meta: dict[str, Any] = {
+            "id": note.id,
+            "title": note_title,
+            "shared": sharing["shared"],
+            "shared_with_me": sharing["shared_with_me"],
+            "unchecked_count": len(note_pending),
+        }
+        if sharing["owner"]:
+            meta["owner"] = sharing["owner"]
+        keep_lists_meta.append(meta)
+
+    return pending_items, keep_lists_meta
+
+
+def _apply_keep_item_checked(keep_item: Any, keep_note: Any = None) -> None:
+    """Coche un article Google Keep en veillant à renseigner parent_server_id (listes partagées)."""
+    if keep_note is not None:
+        note_server_id = getattr(keep_note, "server_id", None)
+        if note_server_id and getattr(keep_item, "parent_server_id", None) is None:
+            keep_item.parent_server_id = note_server_id
+    keep_item.checked = True
+
+
+def mark_google_keep_items_checked(
+    keep_client: Any,
+    tasks_to_mark_done: list[dict],
+) -> None:
+    """
+    Coche les articles traités dans Google Keep et synchronise avec reprise en cas de conflit
+    (notamment lors d'éditions concurrentes sur une liste partagée).
+    """
+    if not tasks_to_mark_done:
+        return
+
+    for task in tasks_to_mark_done:
+        _apply_keep_item_checked(task["_keep_item"], task.get("_keep_note"))
+
+    if keep_client is None:
+        return
+
+    try:
+        keep_client.sync()
+        return
+    except Exception:
+        pass
+
+    try:
+        keep_client.sync(resync=True)
+
+        notes_by_id: dict[str, Any] = {}
+        notes_by_server_id: dict[str, Any] = {}
+        for note in keep_client.all():
+            if getattr(note, "trashed", False) or getattr(note, "deleted", False):
+                continue
+            nid = getattr(note, "id", None)
+            if nid:
+                notes_by_id[nid] = note
+            sid = getattr(note, "server_id", None)
+            if sid:
+                notes_by_server_id[sid] = note
+
+        reapplied = False
+        for task in tasks_to_mark_done:
+            note_id = task.get("keep_note_id")
+            note_sid = task.get("keep_note_server_id")
+            refreshed_note = notes_by_id.get(note_id) if note_id else None
+            if refreshed_note is None and note_sid:
+                refreshed_note = notes_by_server_id.get(note_sid)
+            if refreshed_note is None and note_id and hasattr(keep_client, "get"):
+                candidate = keep_client.get(note_id)
+                if (
+                    candidate is not None
+                    and not getattr(candidate, "trashed", False)
+                    and not getattr(candidate, "deleted", False)
+                ):
+                    refreshed_note = candidate
+
+            if refreshed_note is None or not hasattr(refreshed_note, "unchecked"):
+                continue
+
+            target_item_id = task.get("id")
+            target_item_sid = task.get("keep_item_server_id")
+            matched_item = next(
+                (
+                    it
+                    for it in refreshed_note.unchecked
+                    if target_item_id and getattr(it, "id", None) == target_item_id
+                ),
+                None,
+            )
+            if matched_item is None and target_item_sid:
+                matched_item = next(
+                    (
+                        it
+                        for it in refreshed_note.unchecked
+                        if getattr(it, "server_id", None) == target_item_sid
+                    ),
+                    None,
+                )
+
+            if matched_item is not None:
+                _apply_keep_item_checked(matched_item, refreshed_note)
+                reapplied = True
+
+        if reapplied:
+            keep_client.sync()
+    except Exception:
+        _KEEP_CACHE["client"] = None
+        raise
+
+
+def get_google_keep_pending_items() -> tuple[Any, list[dict], list[dict]]:
     """
     Authentifie (ou rafraîchit via sync incrémentale) le client Google Keep
-    via Master Token et retourne : (keep_client, liste_des_articles_non_cochés).
+    via Master Token et retourne : (keep_client, liste_articles_non_cochés, métadonnées_listes).
     """
     if gkeepapi is None:
         raise RuntimeError(
@@ -505,15 +877,31 @@ def get_google_keep_pending_items() -> tuple[Any, list[dict]]:
 
     keep_email = get_env_clean("GOOGLE_KEEP_EMAIL") or get_env_clean("OG_USERNAME")
     keep_master_token = get_env_clean("GOOGLE_KEEP_MASTER_TOKEN")
-    keep_note_id = get_env_clean("GOOGLE_KEEP_NOTE_ID")
+    raw_note_ids = get_env_clean("GOOGLE_KEEP_NOTE_ID") or get_env_clean("GOOGLE_KEEP_NOTE_IDS")
+    note_identifiers = parse_keep_note_ids(raw_note_ids)
 
-    if not all([keep_email, keep_master_token, keep_note_id]):
+    if not all([keep_email, keep_master_token]) or not note_identifiers:
         raise ValueError(
             "Variables Google Keep manquantes : GOOGLE_KEEP_EMAIL, "
             "GOOGLE_KEEP_MASTER_TOKEN et GOOGLE_KEEP_NOTE_ID sont requis."
         )
 
+    def _authenticate_fresh() -> Any:
+        client = gkeepapi.Keep()
+        try:
+            client.authenticate(keep_email, keep_master_token)
+        except Exception as auth_err:
+            _KEEP_CACHE["client"] = None
+            raise RuntimeError(
+                f"Échec d'authentification Google Keep pour '{keep_email}' : {auth_err}"
+            ) from auth_err
+        _KEEP_CACHE["email"] = keep_email
+        _KEEP_CACHE["master_token"] = keep_master_token
+        _KEEP_CACHE["client"] = client
+        return client
+
     keep = None
+    used_cache = False
     if (
         _KEEP_CACHE["client"] is not None
         and _KEEP_CACHE["email"] == keep_email
@@ -523,59 +911,29 @@ def get_google_keep_pending_items() -> tuple[Any, list[dict]]:
         try:
             cached_keep.sync()
             keep = cached_keep
+            used_cache = True
         except Exception:
+            _KEEP_CACHE["client"] = None
             keep = None
 
     if keep is None:
-        keep = gkeepapi.Keep()
+        keep = _authenticate_fresh()
+
+    try:
+        keep_notes = resolve_keep_notes(keep, note_identifiers, current_email=keep_email)
+    except ValueError:
+        if not used_cache:
+            raise
         try:
-            keep.authenticate(keep_email, keep_master_token)
-        except Exception as auth_err:
-            _KEEP_CACHE["client"] = None
-            raise RuntimeError(
-                f"Échec d'authentification Google Keep pour '{keep_email}' : {auth_err}"
-            ) from auth_err
-        _KEEP_CACHE["email"] = keep_email
-        _KEEP_CACHE["master_token"] = keep_master_token
-        _KEEP_CACHE["client"] = keep
+            keep.sync(resync=True)
+        except Exception:
+            keep = _authenticate_fresh()
+        keep_notes = resolve_keep_notes(keep, note_identifiers, current_email=keep_email)
 
-    keep_note = keep.get(keep_note_id)
-    if keep_note is None or getattr(keep_note, "trashed", False):
-        non_trashed = [n for n in keep.all() if not getattr(n, "trashed", False)]
-        keep_note = next(
-            (
-                n
-                for n in non_trashed
-                if (getattr(n, "title", "") or "").strip().lower() == keep_note_id.lower()
-            ),
-            None,
-        )
-        if keep_note is None:
-            available = ", ".join(
-                f"'{getattr(n, 'title', '') or '(sans titre)'}' (id={n.id})"
-                for n in non_trashed
-            ) or "aucune note trouvée"
-            raise ValueError(
-                f"GOOGLE_KEEP_NOTE_ID='{keep_note_id}' introuvable dans Google Keep. "
-                f"Notes disponibles : {available}"
-            )
-
-    if not hasattr(keep_note, "unchecked"):
-        raise ValueError(
-            f"La note Google Keep '{getattr(keep_note, 'title', keep_note.id)}' "
-            "n'est pas une liste à cases à cocher."
-        )
-
-    pending_items = [
-        {
-            "id": item.id,
-            "title": item.text.strip(),
-            "_keep_item": item,
-        }
-        for item in keep_note.unchecked
-        if (getattr(item, "text", "") or "").strip()
-    ]
-    return keep, pending_items
+    pending_items, keep_lists_meta = collect_keep_pending_items(
+        keep_notes, current_email=keep_email
+    )
+    return keep, pending_items, keep_lists_meta
 
 
 async def _gather_bounded(
@@ -601,6 +959,7 @@ def _build_sync_response(
     processed_items: list[dict],
     keep_crossed_off: int | None,
     deleted_crossed_off_items: list[dict],
+    keep_lists: list[dict] | None = None,
 ) -> dict:
     """Construit la réponse JSON standardisée de /api/sync."""
     if has_pending_tasks:
@@ -622,6 +981,8 @@ def _build_sync_response(
         "message": message,
         "items": processed_items,
     }
+    if keep_lists is not None:
+        response["keep_lists"] = keep_lists
     if keep_crossed_off is not None:
         response["deleted_crossed_off_count"] = len(deleted_crossed_off_items)
         response["deleted_crossed_off_items"] = deleted_crossed_off_items
@@ -667,12 +1028,13 @@ async def sync_tasks_to_groceries(
     # 1. Récupération des articles non cochés depuis Google Keep (prioritaire) ou Google Tasks
     keep_master_token = get_env_clean("GOOGLE_KEEP_MASTER_TOKEN")
     keep_client: Any = None
+    keep_lists_meta: list[dict] | None = None
     tasks_service: Any = None
     task_list_id = ""
 
     if keep_master_token:
         source_name = "google_keep"
-        keep_client, pending_tasks = get_google_keep_pending_items()
+        keep_client, pending_tasks, keep_lists_meta = get_google_keep_pending_items()
     else:
         task_list_id = get_env_clean("GOOGLE_TASK_LIST_ID")
         if not task_list_id:
@@ -691,7 +1053,15 @@ async def sync_tasks_to_groceries(
         pending_tasks = [t for t in raw_tasks if t.get("title", "").strip()]
 
     if not pending_tasks and keep_crossed_off is None:
-        return _build_sync_response(source_name, dry_run, False, [], None, [])
+        return _build_sync_response(
+            source_name,
+            dry_run,
+            False,
+            [],
+            None,
+            [],
+            keep_lists=keep_lists_meta,
+        )
 
     # 2. Connexion à OurGroceries et lecture des éléments de la liste cible
     og = OurGroceries(og_user, og_pass)
@@ -771,6 +1141,7 @@ async def sync_tasks_to_groceries(
             [],
             keep_crossed_off,
             deleted_crossed_off_items,
+            keep_lists=keep_lists_meta,
         )
 
     # 3. Pré-filtrage exact local (évite Gemini sur score == 1.0), puis appel Gemini ciblé
@@ -903,17 +1274,20 @@ async def sync_tasks_to_groceries(
             )
 
         tasks_to_mark_done.append(task)
-        processed_items.append(
-            {
-                "google_task_id": task["id"],
-                "raw_title": raw_title,
-                "ourgroceries_name": target_name,
-                "action": action,
-                "similarity_score": score,
-                "matching_engine": matching_engine,
-                "reason": reason,
-            }
-        )
+        item_payload = {
+            "google_task_id": task["id"],
+            "raw_title": raw_title,
+            "ourgroceries_name": target_name,
+            "action": action,
+            "similarity_score": score,
+            "matching_engine": matching_engine,
+            "reason": reason,
+        }
+        if "keep_note_id" in task:
+            item_payload["keep_note_id"] = task["keep_note_id"]
+        if "keep_note_title" in task:
+            item_payload["keep_note_title"] = task["keep_note_title"]
+        processed_items.append(item_payload)
 
     # 5. Exécution parallèle des écritures OurGroceries, puis clôture dans Google Keep / Tasks
     if not dry_run:
@@ -921,10 +1295,7 @@ async def sync_tasks_to_groceries(
 
         if tasks_to_mark_done:
             if source_name == "google_keep":
-                for task in tasks_to_mark_done:
-                    task["_keep_item"].checked = True
-                if keep_client is not None:
-                    keep_client.sync()
+                mark_google_keep_items_checked(keep_client, tasks_to_mark_done)
             elif tasks_service is not None:
                 for task in tasks_to_mark_done:
                     tasks_service.tasks().patch(
@@ -940,6 +1311,7 @@ async def sync_tasks_to_groceries(
         processed_items,
         keep_crossed_off,
         deleted_crossed_off_items,
+        keep_lists=keep_lists_meta,
     )
 
 

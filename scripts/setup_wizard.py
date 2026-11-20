@@ -4,7 +4,7 @@ Assistant d'initialisation interactif pour gtask-to-ourgroceries (Google Keep ->
 
 Ce script permet de :
 1. Obtenir (ou réutiliser depuis .env) votre GOOGLE_KEEP_MASTER_TOKEN.
-2. Lister vos listes Google Keep et récupérer votre GOOGLE_KEEP_NOTE_ID.
+2. Lister vos listes Google Keep (personnelles et partagées) et sélectionner une ou plusieurs listes (GOOGLE_KEEP_NOTE_ID).
 3. Tester la connexion OurGroceries et récupérer votre OG_LIST_ID.
 4. Configurer optionnellement votre clé gratuite GEMINI_API_KEY (Google AI Studio).
 5. Générer (ou conserver) un CRON_SECRET et sauvegarder toutes les clés dans .env,
@@ -18,13 +18,275 @@ import asyncio
 import getpass
 import json
 import os
+import re
 import secrets
 import sys
 import time
+from typing import Any
 import urllib.error
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import urllib.request
 import webbrowser
+
+
+KEEP_NOTE_URL_RE = re.compile(
+    r"^https?://keep\.google\.com/(?:u/\d+/)?#[a-z]+/([^/?#]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_keep_note_ids(raw_value: str) -> list[str]:
+    """Découpe GOOGLE_KEEP_NOTE_ID (séparé par virgules/retours ligne, guillemets ou URL Keep)."""
+    if not raw_value:
+        return []
+
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,\r\n]+", raw_value):
+        token = part.strip()
+        if len(token) >= 2 and (
+            (token[0] == '"' and token[-1] == '"')
+            or (token[0] == "'" and token[-1] == "'")
+        ):
+            token = token[1:-1].strip()
+        if not token:
+            continue
+
+        url_match = KEEP_NOTE_URL_RE.match(token)
+        if url_match:
+            token = unquote(url_match.group(1)).strip()
+
+        if token and token not in seen:
+            seen.add(token)
+            identifiers.append(token)
+
+    return identifiers
+
+
+def describe_keep_note_sharing(note: Any, current_email: str = "") -> dict[str, Any]:
+    """Extrait l'état de partage (propriétaire, collaborateurs) d'une note Google Keep."""
+    collaborators = getattr(note, "collaborators", None)
+    current_norm = current_email.strip().lower()
+
+    all_emails: list[str] = []
+    seen_emails: set[str] = set()
+    owner_email: str | None = None
+    current_role: str | None = None
+
+    if collaborators is not None:
+        all_fn = getattr(collaborators, "all", None)
+        if callable(all_fn):
+            try:
+                entries = all_fn()
+            except Exception:
+                entries = []
+            for entry in entries or []:
+                email_str = (
+                    entry.strip()
+                    if isinstance(entry, str)
+                    else (getattr(entry, "email", "") or "").strip()
+                )
+                if email_str and email_str.lower() not in seen_emails:
+                    seen_emails.add(email_str.lower())
+                    all_emails.append(email_str)
+
+        raw_collab_map = getattr(collaborators, "_collaborators", None)
+        if isinstance(raw_collab_map, dict):
+            for raw_email, role in raw_collab_map.items():
+                email_str = (
+                    raw_email.strip()
+                    if isinstance(raw_email, str)
+                    else (getattr(raw_email, "email", "") or "").strip()
+                )
+                if not email_str:
+                    continue
+                role_val = getattr(role, "value", role)
+                if role_val == "O" and owner_email is None:
+                    owner_email = email_str
+                if current_norm and email_str.lower() == current_norm:
+                    current_role = str(role_val) if role_val is not None else None
+                if not callable(all_fn) and role_val in ("O", "W", "A"):
+                    if email_str.lower() not in seen_emails:
+                        seen_emails.add(email_str.lower())
+                        all_emails.append(email_str)
+
+    other_collaborators = [
+        email for email in all_emails if not current_norm or email.lower() != current_norm
+    ]
+    shared_with_me = bool(
+        (owner_email and current_norm and owner_email.lower() != current_norm)
+        or current_role == "W"
+    )
+    shared = bool(shared_with_me or other_collaborators)
+
+    return {
+        "shared": shared,
+        "shared_with_me": shared_with_me,
+        "owner": owner_email,
+        "collaborators": all_emails,
+        "other_collaborators": other_collaborators,
+    }
+
+
+def format_keep_note_badges(note: Any, current_email: str = "") -> str:
+    """Formate les badges visuels de partage et d'archivage pour l'assistant."""
+    sharing = describe_keep_note_sharing(note, current_email=current_email)
+    badges: list[str] = []
+    if sharing["shared_with_me"]:
+        if sharing["owner"]:
+            badges.append(f"[🤝 partagée par {sharing['owner']}]")
+        else:
+            badges.append("[🤝 partagée avec vous]")
+    elif sharing["other_collaborators"]:
+        badges.append(f"[🤝 partagée avec {', '.join(sharing['other_collaborators'])}]")
+    if getattr(note, "archived", False):
+        badges.append("[📦 archivée]")
+    return " ".join(badges)
+
+
+def sort_keep_notes_for_wizard(notes: list[Any]) -> list[Any]:
+    """Filtre les notes supprimées/corbeille et trie : listes actives, archivées, puis notes texte."""
+    live_notes = [
+        n
+        for n in notes
+        if not getattr(n, "trashed", False) and not getattr(n, "deleted", False)
+    ]
+    return sorted(
+        live_notes,
+        key=lambda n: (not hasattr(n, "unchecked"), bool(getattr(n, "archived", False))),
+    )
+
+
+def find_default_keep_indices(notes: list[Any], raw_current_ids: str) -> list[int]:
+    """Retourne les indices (base 1) des listes correspondant à GOOGLE_KEEP_NOTE_ID."""
+    tokens = parse_keep_note_ids(raw_current_ids)
+    if not tokens:
+        return []
+
+    indices: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        id_matches = [
+            idx
+            for idx, note in enumerate(notes, start=1)
+            if getattr(note, "id", None) == token
+            or (
+                getattr(note, "server_id", None) is not None
+                and getattr(note, "server_id", None) == token
+            )
+        ]
+        if id_matches:
+            for idx in id_matches:
+                if idx not in seen:
+                    seen.add(idx)
+                    indices.append(idx)
+            continue
+
+        token_lower = token.strip().lower()
+        title_matches = [
+            (idx, note)
+            for idx, note in enumerate(notes, start=1)
+            if hasattr(note, "unchecked")
+            and (getattr(note, "title", "") or "").strip().lower() == token_lower
+        ]
+        if title_matches:
+            active = [idx for idx, note in title_matches if not getattr(note, "archived", False)]
+            chosen = active if active else [idx for idx, _ in title_matches]
+            for idx in chosen:
+                if idx not in seen:
+                    seen.add(idx)
+                    indices.append(idx)
+
+    return indices
+
+
+def parse_wizard_keep_selection(
+    choice: str,
+    notes: list[Any],
+    default_indices: list[int],
+) -> tuple[list[Any], bool, list[str]]:
+    """
+    Parse la saisie utilisateur dans l'assistant Keep (ex: '', '1,2', '0', '0,2', ID ou URL).
+    Retourne (listes_sélectionnées, créer_nouvelle_liste, erreurs).
+    """
+    selected: list[Any] = []
+    seen_ids: set[str] = set()
+    errors: list[str] = []
+    create_new = False
+
+    def _add_checklist(note: Any) -> None:
+        if not hasattr(note, "unchecked"):
+            title = (getattr(note, "title", "") or "").strip() or "(Sans titre)"
+            errors.append(
+                f"La note '{title}' (ID: {note.id}) est une note texte sans cases à cocher."
+            )
+            return
+        nid = getattr(note, "id", None)
+        if nid not in seen_ids:
+            if nid is not None:
+                seen_ids.add(nid)
+            selected.append(note)
+
+    raw_choice = choice.strip()
+    if not raw_choice:
+        if default_indices:
+            for idx in default_indices:
+                if 1 <= idx <= len(notes):
+                    _add_checklist(notes[idx - 1])
+            return selected, False, errors
+
+        first_checklist = next((n for n in notes if hasattr(n, "unchecked")), None)
+        if first_checklist is not None:
+            _add_checklist(first_checklist)
+            return selected, False, errors
+
+        return [], True, []
+
+    tokens = [t.strip() for t in re.split(r"[\s,;]+", raw_choice) if t.strip()]
+    for raw_token in tokens:
+        token = raw_token
+        if len(token) >= 2 and (
+            (token[0] == '"' and token[-1] == '"')
+            or (token[0] == "'" and token[-1] == "'")
+        ):
+            token = token[1:-1].strip()
+        if not token:
+            continue
+
+        if token == "0":
+            create_new = True
+            continue
+
+        if token.isdigit():
+            num = int(token)
+            if 1 <= num <= len(notes):
+                _add_checklist(notes[num - 1])
+            else:
+                errors.append(
+                    f"Numéro invalide : {token} (attendu entre 1 et {len(notes)}, ou 0)."
+                )
+            continue
+
+        url_match = KEEP_NOTE_URL_RE.match(token)
+        norm_token = unquote(url_match.group(1)).strip() if url_match else token
+        matched_note = next(
+            (
+                n
+                for n in notes
+                if getattr(n, "id", None) == norm_token
+                or (
+                    getattr(n, "server_id", None) is not None
+                    and getattr(n, "server_id", None) == norm_token
+                )
+            ),
+            None,
+        )
+        if matched_note is not None:
+            _add_checklist(matched_note)
+        else:
+            errors.append(f"Choix ou ID inconnu : '{token}'.")
+
+    return selected, create_new, errors
 
 
 def load_existing_env(env_path: str = ".env") -> dict[str, str]:
@@ -81,7 +343,10 @@ def setup_google_keep(existing_env: dict[str, str]) -> tuple[str, str, str]:
         "OG_USERNAME", ""
     )
     existing_token = existing_env.get("GOOGLE_KEEP_MASTER_TOKEN", "")
-    current_note_id = existing_env.get("GOOGLE_KEEP_NOTE_ID", "")
+    current_note_ids = (
+        existing_env.get("GOOGLE_KEEP_NOTE_ID")
+        or existing_env.get("GOOGLE_KEEP_NOTE_IDS", "")
+    )
 
     keep = gkeepapi.Keep()
     keep_email = default_email
@@ -165,48 +430,69 @@ def setup_google_keep(existing_env: dict[str, str]) -> tuple[str, str, str]:
         except Exception as exc:
             print(f"❌ Échec de connexion Google Keep : {exc}")
 
-    notes = [n for n in keep.all() if not getattr(n, "trashed", False)]
-    default_choice = 1
+    notes = sort_keep_notes_for_wizard(keep.all())
+    default_indices = find_default_keep_indices(notes, current_note_ids)
+    if not default_indices:
+        first_checklist_idx = next(
+            (i for i, n in enumerate(notes, start=1) if hasattr(n, "unchecked")),
+            None,
+        )
+        if first_checklist_idx is not None:
+            default_indices = [first_checklist_idx]
+
     print("\n📝 Vos listes et notes Google Keep disponibles :")
     print("  [0] ➕ Créer une nouvelle liste Google Keep")
     for idx, note in enumerate(notes, start=1):
         title = (getattr(note, "title", "") or "").strip() or "(Sans titre)"
+        badges = format_keep_note_badges(note, current_email=keep_email)
+        badge_suffix = f" {badges}" if badges else ""
         if hasattr(note, "unchecked") and hasattr(note, "checked"):
             info = f"({len(note.unchecked)} non cochés, {len(note.checked)} cochés)"
         else:
             info = "(note texte — pas de cases à cocher)"
 
-        marker = ""
-        if note.id == current_note_id:
-            default_choice = idx
-            marker = "  👈 (actuel dans .env)"
+        marker = "  👈 (actuel dans .env)" if idx in default_indices else ""
+        print(f"  [{idx}] {title}{badge_suffix}  {info} — ID: {note.id}{marker}")
 
-        print(f"  [{idx}] {title}  {info} — ID: {note.id}{marker}")
+    default_display = (
+        ",".join(str(i) for i in default_indices) if default_indices else "0"
+    )
+    while True:
+        choice = input(
+            f"\n👉 Choisissez un ou plusieurs numéros séparés par des virgules "
+            f"(ex: 1,2 — ou 0 pour créer une nouvelle liste) [{default_display}] : "
+        ).strip()
+        selected_notes, create_new, errors = parse_wizard_keep_selection(
+            choice, notes, default_indices
+        )
+        if errors:
+            for err in errors:
+                print(f"❌ {err}")
+            continue
+        if not selected_notes and not create_new:
+            print("❌ Veuillez sélectionner au moins une liste ou saisir 0 pour en créer une.")
+            continue
+        break
 
-    choice = input(
-        f"\n👉 Choisissez le numéro de la liste à surveiller [{default_choice}] : "
-    ).strip()
-    if choice == "0" or not notes:
+    if create_new:
         new_name = (
             input("Nom de la nouvelle liste Google Keep (ex: Liste de courses) : ").strip()
             or "Liste de courses"
         )
         created = keep.createList(new_name, [])
         keep.sync()
-        note_id = created.id
-        print(f"✅ Liste '{created.title}' créée avec l'ID : {note_id}")
-    else:
-        idx = (
-            int(choice) - 1
-            if choice.isdigit() and 1 <= int(choice) <= len(notes)
-            else default_choice - 1
-        )
-        selected = notes[idx]
-        note_id = selected.id
-        selected_title = (getattr(selected, "title", "") or "").strip() or "(Sans titre)"
-        print(f"✅ Liste sélectionnée : '{selected_title}' (ID: {note_id})")
+        selected_notes.append(created)
+        print(f"✅ Liste '{created.title}' créée avec l'ID : {created.id}")
 
-    return keep_email, master_token, note_id
+    note_ids_value = ",".join(n.id for n in selected_notes)
+    print(f"\n✅ {len(selected_notes)} liste(s) Google Keep sélectionnée(s) :")
+    for note in selected_notes:
+        title = (getattr(note, "title", "") or "").strip() or "(Sans titre)"
+        badges = format_keep_note_badges(note, current_email=keep_email)
+        badge_suffix = f" {badges}" if badges else ""
+        print(f"   • {title}{badge_suffix} (ID: {note.id})")
+
+    return keep_email, master_token, note_ids_value
 
 
 async def setup_ourgroceries(existing_env: dict[str, str]) -> tuple[str, str, str]:
@@ -374,6 +660,12 @@ def setup_gemini(existing_env: dict[str, str]) -> str:
 
 
 def main():
+    if os.name == "nt":
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(sys, stream_name, None)
+            if stream and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
+
     check_dependencies()
 
     env_path = os.path.join(os.getcwd(), ".env")
@@ -401,13 +693,14 @@ def main():
         f'MATCH_CUTOFF="{match_cutoff}"',
     ]
 
-    # Préserve d'éventuelles clés Google Tasks / GEMINI_MODEL existantes dans .env
+    # Préserve d'éventuelles clés Google Tasks / GEMINI_MODEL / OG_KEEP_CROSSED_OFF existantes dans .env
     for legacy_key in (
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "GOOGLE_REFRESH_TOKEN",
         "GOOGLE_TASK_LIST_ID",
         "GEMINI_MODEL",
+        "OG_KEEP_CROSSED_OFF",
     ):
         if existing_env.get(legacy_key):
             env_lines.append(f'{legacy_key}="{existing_env[legacy_key]}"')
